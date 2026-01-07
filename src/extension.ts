@@ -110,23 +110,23 @@ interface ExtensionMessage {
  */
 class OracleDockViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'oracledock.sidebarView';
-  
+
   // Storage key for globalState persistence
   private static readonly STORAGE_KEY = 'oracledock.persistedState';
 
   private _view?: vscode.WebviewView;
-  
+
   // Session registry - maps sessionId to Session object
   // Maintains all active sessions with isolated lifecycles
   private _sessions: Map<string, Session> = new Map();
-  
+
   // Counter for generating unique session IDs
   private _sessionCounter = 0;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _context: vscode.ExtensionContext
-  ) {}
+  ) { }
 
   /**
    * Called when the Webview becomes visible.
@@ -267,14 +267,14 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    */
   private _checkCommandInstalled(command: string): void {
     const { execSync } = require('child_process');
-    
+
     try {
       // Use 'which' to resolve command path - macOS first
-      const resolvedPath = execSync(`which ${command}`, { 
+      const resolvedPath = execSync(`which ${command}`, {
         encoding: 'utf8',
         timeout: 5000  // 5 second timeout to avoid hangs
       }).trim();
-      
+
       // Command found - report as installed
       this._postMessage({
         type: 'commandStatus',
@@ -475,7 +475,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       ptyProcess.onData((data: string) => {
         // Buffer output for session switching replay
         session.outputBuffer.push(data);
-        
+
         // Stream to Webview
         this._postMessage({
           type: 'sessionOutput',
@@ -488,10 +488,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       ptyProcess.onExit(({ exitCode }) => {
         session.state = 'exited';
         session.exitCode = exitCode;
-        
+
         // Persist session state with output snapshot
         this._persistSessionState(session);
-        
+
         this._postMessage({
           type: 'sessionExited',
           sessionId,
@@ -561,7 +561,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    */
   private _getHtmlForWebview(webview: vscode.Webview): string {
     const nonce = getNonce();
-    
+
     // Get URIs for bundled xterm assets
     const xtermJsUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.js'));
     const xtermCssUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.css'));
@@ -582,268 +582,264 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   <title>Oracle Dock</title>
   <link rel="stylesheet" href="${xtermCssUri}">
   <style>
-    /* Minimal functional layout - no polish */
+    /* ========== SLEEK UI - Stage 6 ========== */
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    :root {
+      --rail-width: 60px;
+      --topbar-height: 36px;
+      --font-ui: 12px;
+      --font-mono: 13px;
+      --radius-overlay: 10px;
+    }
+    
     html, body { 
       height: 100%; 
       width: 100%; 
       overflow: hidden;
-      background: #1e1e1e;
-      color: #d4d4d4;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      font-size: 12px;
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: var(--font-ui);
     }
     
-    /* Tab navigation */
-    #tab-bar {
+    /* ========== LAYOUT ========== */
+    #app-container {
       display: flex;
-      background: #252526;
-      border-bottom: 1px solid #3c3c3c;
-    }
-    .tab {
-      padding: 6px 12px;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      font-size: 11px;
-    }
-    .tab:hover { background: #2a2d2e; }
-    .tab.active { border-bottom-color: #007acc; color: #fff; }
-    
-    /* Panels */
-    .panel { display: none; }
-    .panel.active { display: block; }
-    
-    /* Control panel (profiles + spawn) */
-    #control-panel {
-      background: #252526;
-      border-bottom: 1px solid #3c3c3c;
-      max-height: 200px;
-      overflow-y: auto;
-    }
-    
-    /* Profile list */
-    #profile-list {
-      list-style: none;
-      max-height: 100px;
-      overflow-y: auto;
-    }
-    .profile-item {
-      display: flex;
-      align-items: center;
-      padding: 4px 6px;
-      border-bottom: 1px solid #333;
-      cursor: pointer;
-    }
-    .profile-item:hover { background: #2a2d2e; }
-    .profile-item.selected { background: #094771; }
-    .profile-label {
-      flex: 1;
-      font-size: 11px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .profile-command {
-      font-family: monospace;
-      font-size: 10px;
-      color: #888;
-      margin-left: 8px;
-    }
-    .profile-btn {
-      padding: 2px 6px;
-      margin-left: 4px;
-      background: #3c3c3c;
-      border: none;
-      color: #ccc;
-      cursor: pointer;
-      font-size: 10px;
-    }
-    .profile-btn:hover { background: #4c4c4c; }
-    .profile-btn.delete { background: #5a1d1d; color: #f88; }
-    .profile-btn.delete:hover { background: #7a2d2d; }
-    
-    /* CLI Status indicators */
-    .cli-status {
-      font-size: 9px;
-      padding: 1px 4px;
-      border-radius: 2px;
-      margin-left: 4px;
-    }
-    .cli-status.installed { background: #2d5a2d; color: #8f8; }
-    .cli-status.missing { background: #5a4a1d; color: #fa8; }
-    .cli-status.checking { background: #3c3c3c; color: #888; }
-    
-    /* Install hint */
-    .install-hint {
-      font-size: 10px;
-      color: #888;
-      padding: 4px 6px;
-      background: #2a2a2a;
-      border-left: 2px solid #5a4a1d;
-      margin: 4px 6px;
-      font-family: monospace;
-    }
-    .install-hint code {
-      color: #fa8;
-      background: #333;
-      padding: 1px 4px;
-      border-radius: 2px;
-    }
-    
-    /* Spawn row */
-    #spawn-row {
-      display: flex;
-      padding: 6px;
-      gap: 4px;
-      border-bottom: 1px solid #3c3c3c;
-      flex-wrap: wrap;
-    }
-    #profile-select {
-      padding: 4px 8px;
-      background: #3c3c3c;
-      border: 1px solid #555;
-      color: #fff;
-      font-size: 11px;
-      min-width: 120px;
-    }
-    #extra-args-input {
-      flex: 1;
-      min-width: 100px;
-      padding: 4px 8px;
-      background: #3c3c3c;
-      border: 1px solid #555;
-      color: #fff;
-      font-family: monospace;
-      font-size: 12px;
-    }
-    #extra-args-input:focus, #profile-select:focus {
-      outline: 1px solid #007acc;
-      border-color: #007acc;
-    }
-    #spawn-btn {
-      padding: 4px 8px;
-      background: #0e639c;
-      border: none;
-      color: #fff;
-      cursor: pointer;
-      font-size: 11px;
-    }
-    #spawn-btn:hover { background: #1177bb; }
-    #spawn-btn:disabled { background: #555; cursor: not-allowed; }
-    
-    /* Profile editor */
-    #profile-editor {
-      padding: 6px;
-      border-bottom: 1px solid #3c3c3c;
-      background: #2d2d2d;
-    }
-    #profile-editor.hidden { display: none; }
-    .editor-row {
-      display: flex;
-      gap: 4px;
-      margin-bottom: 4px;
-      align-items: center;
-    }
-    .editor-row label {
-      width: 80px;
-      font-size: 11px;
-    }
-    .editor-row input {
-      flex: 1;
-      padding: 3px 6px;
-      background: #3c3c3c;
-      border: 1px solid #555;
-      color: #fff;
-      font-family: monospace;
-      font-size: 11px;
-    }
-    .editor-row input:focus {
-      outline: 1px solid #007acc;
-      border-color: #007acc;
-    }
-    .editor-row input[type="checkbox"] {
-      flex: none;
-      width: 14px;
-      height: 14px;
-    }
-    .editor-buttons {
-      display: flex;
-      gap: 4px;
-      margin-top: 6px;
-    }
-    .editor-buttons button {
-      padding: 4px 10px;
-      border: none;
-      cursor: pointer;
-      font-size: 11px;
-    }
-    #save-profile-btn { background: #0e639c; color: #fff; }
-    #save-profile-btn:hover { background: #1177bb; }
-    #cancel-profile-btn { background: #3c3c3c; color: #ccc; }
-    #cancel-profile-btn:hover { background: #4c4c4c; }
-    #add-profile-btn {
-      padding: 4px 8px;
-      margin: 6px;
-      background: #2d5a2d;
-      border: none;
-      color: #8f8;
-      cursor: pointer;
-      font-size: 11px;
-    }
-    #add-profile-btn:hover { background: #3d6a3d; }
-    
-    /* Session list */
-    #session-panel {
-      background: #252526;
-      border-bottom: 1px solid #3c3c3c;
-      max-height: 120px;
-      overflow-y: auto;
-    }
-    #session-list {
-      list-style: none;
-    }
-    .session-item {
-      display: flex;
-      align-items: center;
-      padding: 4px 6px;
-      border-bottom: 1px solid #333;
-      cursor: pointer;
-    }
-    .session-item:hover { background: #2a2d2e; }
-    .session-item.active { background: #094771; }
-    .session-item.exited { opacity: 0.6; }
-    .session-command {
-      flex: 1;
-      font-family: monospace;
-      font-size: 11px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .session-state {
-      font-size: 10px;
-      margin-right: 6px;
-      padding: 1px 4px;
-      border-radius: 2px;
-    }
-    .session-state.running { background: #2d5a2d; color: #8f8; }
-    .session-state.exited { background: #5a2d2d; color: #f88; }
-    .kill-btn {
-      padding: 2px 6px;
-      background: #5a1d1d;
-      border: none;
-      color: #f88;
-      cursor: pointer;
-      font-size: 10px;
-    }
-    .kill-btn:hover { background: #7a2d2d; }
-    
-    /* Terminal container */
-    #terminal-container {
-      height: calc(100% - 220px);
+      height: 100%;
       width: 100%;
-      position: relative;
     }
+    
+    /* Left Rail */
+    #left-rail {
+      width: var(--rail-width);
+      min-width: var(--rail-width);
+      height: 100%;
+      background: var(--vscode-editor-background);
+      border-right: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    
+    .rail-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 8px 0;
+    }
+    
+    .rail-section-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 6px;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      transform: rotate(180deg);
+    }
+    
+    .rail-separator {
+      height: 1px;
+      width: 40px;
+      margin: 4px auto;
+      background: var(--vscode-panel-border, rgba(128,128,128,0.2));
+    }
+    
+    .rail-item {
+      position: relative;
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      border-radius: 8px;
+      margin: 2px 0;
+      transition: background 0.15s ease;
+    }
+    
+    .rail-item:hover {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    
+    .rail-item.active {
+      background: var(--vscode-list-activeSelectionBackground, rgba(0,122,204,0.3));
+    }
+    
+    .rail-item .accent-bar {
+      position: absolute;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 3px;
+      height: 20px;
+      background: var(--vscode-focusBorder);
+      border-radius: 0 2px 2px 0;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    
+    .rail-item.active .accent-bar {
+      opacity: 1;
+    }
+    
+    .rail-item .state-indicator {
+      position: absolute;
+      bottom: 6px;
+      right: 6px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--vscode-descriptionForeground);
+    }
+    
+    .rail-item .state-indicator.running {
+      background: #4ec9b0;
+    }
+    
+    .rail-item .state-indicator.exited {
+      background: #f14c4c;
+    }
+    
+    .rail-item .state-indicator.installed {
+      background: #4ec9b0;
+    }
+    
+    .rail-item .state-indicator.missing {
+      background: #cca700;
+    }
+    
+    .rail-item svg {
+      width: 20px;
+      height: 20px;
+      color: var(--vscode-editor-foreground);
+      opacity: 0.8;
+    }
+    
+    .rail-item:hover svg {
+      opacity: 1;
+    }
+    
+    .rail-add-btn {
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      border-radius: 8px;
+      margin: 2px 0;
+      border: 1px dashed var(--vscode-descriptionForeground);
+      opacity: 0.5;
+      transition: all 0.15s ease;
+    }
+    
+    .rail-add-btn:hover {
+      opacity: 1;
+      border-color: var(--vscode-focusBorder);
+    }
+    
+    .rail-add-btn svg {
+      width: 16px;
+      height: 16px;
+      color: var(--vscode-descriptionForeground);
+    }
+    
+    /* Main Panel */
+    #main-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-width: 0;
+    }
+    
+    /* Top Bar */
+    #top-bar {
+      height: var(--topbar-height);
+      min-height: var(--topbar-height);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      background: var(--vscode-editor-background);
+      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+    }
+    
+    #active-label {
+      font-family: 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
+      font-size: var(--font-mono);
+      color: var(--vscode-editor-foreground);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+      margin-right: 12px;
+    }
+    
+    #active-label .state-badge {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-right: 8px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    
+    #active-label .state-badge.running {
+      background: rgba(78, 201, 176, 0.2);
+      color: #4ec9b0;
+    }
+    
+    #active-label .state-badge.exited {
+      background: rgba(241, 76, 76, 0.2);
+      color: #f14c4c;
+    }
+    
+    #top-bar-actions {
+      display: flex;
+      gap: 4px;
+    }
+    
+    .topbar-btn {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      color: var(--vscode-editor-foreground);
+      opacity: 0.7;
+      transition: all 0.15s ease;
+    }
+    
+    .topbar-btn:hover {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+      opacity: 1;
+    }
+    
+    .topbar-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    
+    .topbar-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+    
+    /* Terminal Surface */
+    #terminal-surface {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+    
     .terminal-wrapper {
       position: absolute;
       top: 0;
@@ -851,142 +847,455 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       width: 100%;
       height: 100%;
     }
-    .terminal-wrapper.hidden { display: none; }
     
-    /* Error display */
-    #error-display {
-      color: #f44;
-      padding: 8px;
-      font-family: monospace;
-      font-size: 12px;
+    .terminal-wrapper.hidden {
+      visibility: hidden;
+      pointer-events: none;
+    }
+    
+    /* Empty State */
+    #empty-state {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--vscode-descriptionForeground);
+      gap: 12px;
+    }
+    
+    #empty-state svg {
+      width: 48px;
+      height: 48px;
+      opacity: 0.3;
+    }
+    
+    #empty-state p {
+      font-size: 13px;
+    }
+    
+    #empty-state.hidden {
       display: none;
     }
     
-    /* Empty state */
-    #empty-state {
+    /* ========== MODAL OVERLAYS ========== */
+    .modal-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.6);
       display: flex;
       align-items: center;
       justify-content: center;
-      height: 100%;
-      color: #666;
-      font-size: 13px;
+      z-index: 100;
+    }
+    
+    .modal-overlay.hidden {
+      display: none;
+    }
+    
+    .modal-content {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
+      border-radius: var(--radius-overlay);
+      padding: 20px;
+      min-width: 300px;
+      max-width: 400px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+    
+    .modal-content h3 {
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 16px;
+      color: var(--vscode-editor-foreground);
+    }
+    
+    .modal-field {
+      margin-bottom: 12px;
+    }
+    
+    .modal-field label {
+      display: block;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 4px;
+    }
+    
+    .modal-field input,
+    .modal-field select {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
+      border-radius: 4px;
+      color: var(--vscode-input-foreground);
+      font-size: 12px;
+      font-family: inherit;
+    }
+    
+    .modal-field input:focus,
+    .modal-field select:focus {
+      outline: none;
+      border-color: var(--vscode-focusBorder);
+    }
+    
+    .modal-field input[type="text"] {
+      font-family: 'SF Mono', Menlo, Monaco, monospace;
+    }
+    
+    .modal-field .cli-status {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-left: 8px;
+    }
+    
+    .modal-field .cli-status.installed {
+      background: rgba(78, 201, 176, 0.2);
+      color: #4ec9b0;
+    }
+    
+    .modal-field .cli-status.missing {
+      background: rgba(204, 167, 0, 0.2);
+      color: #cca700;
+    }
+    
+    .modal-field .cli-status.checking {
+      color: var(--vscode-descriptionForeground);
+    }
+    
+    .modal-field .install-hint {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      margin-top: 4px;
+      padding: 6px 8px;
+      background: var(--vscode-input-background);
+      border-radius: 4px;
+      font-family: 'SF Mono', Menlo, Monaco, monospace;
+    }
+    
+    .modal-field .install-hint code {
+      color: #cca700;
+    }
+    
+    .modal-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    
+    .modal-checkbox input {
+      width: 16px;
+      height: 16px;
+    }
+    
+    .modal-checkbox span {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+    }
+    
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 20px;
+    }
+    
+    /* ASCII Art Preview */
+    .ascii-preview {
+      margin: 16px 0;
+      padding: 12px;
+      background: #0d0d0d;
+      border-radius: 6px;
+      overflow-x: auto;
+      min-height: 120px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .ascii-preview pre {
+      margin: 0;
+      font-family: 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
+      font-size: 10px;
+      line-height: 1.1;
+      white-space: pre;
+      text-align: center;
+    }
+    
+    .ascii-preview.hidden {
+      display: none;
+    }
+    
+    .modal-btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    
+    .modal-btn.primary {
+      background: var(--vscode-button-background, #0e639c);
+      color: var(--vscode-button-foreground, #fff);
+    }
+    
+    .modal-btn.primary:hover {
+      background: var(--vscode-button-hoverBackground, #1177bb);
+    }
+    
+    .modal-btn.secondary {
+      background: transparent;
+      color: var(--vscode-editor-foreground);
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
+    }
+    
+    .modal-btn.secondary:hover {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    
+    .modal-btn.danger {
+      background: rgba(241, 76, 76, 0.2);
+      color: #f14c4c;
+    }
+    
+    .modal-btn.danger:hover {
+      background: rgba(241, 76, 76, 0.3);
+    }
+    
+    /* ========== TOOLTIP ========== */
+    .tooltip {
+      position: fixed;
+      background: var(--vscode-editorWidget-background, #252526);
+      color: var(--vscode-editorWidget-foreground, #ccc);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      pointer-events: none;
+      z-index: 200;
+      border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.3));
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      white-space: nowrap;
+    }
+    
+    .tooltip.hidden {
+      display: none;
+    }
+    
+    /* ========== SCROLLBAR ========== */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+      background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.3));
+      border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--vscode-scrollbarSlider-hoverBackground, rgba(128,128,128,0.5));
     }
   </style>
 </head>
 <body>
-  <!-- Tab navigation for Profiles/Sessions views -->
-  <div id="tab-bar">
-    <div class="tab active" data-tab="profiles">Profiles</div>
-    <div class="tab" data-tab="sessions">Sessions</div>
-  </div>
-  
-  <!-- Profiles panel -->
-  <div id="profiles-panel" class="panel active">
-    <!-- Profile editor (hidden by default) -->
-    <div id="profile-editor" class="hidden">
-      <div class="editor-row">
-        <label>Label:</label>
-        <input type="text" id="editor-label" placeholder="e.g., Claude Agent">
-      </div>
-      <div class="editor-row">
-        <label>Command:</label>
-        <input type="text" id="editor-command" placeholder="e.g., claude">
-        <span id="editor-cli-status" class="cli-status checking">...</span>
-      </div>
-      <!-- Install hint shown when CLI is missing -->
-      <div id="editor-install-hint" class="install-hint" style="display:none;"></div>
-      <div class="editor-row">
-        <label>Default Args:</label>
-        <input type="text" id="editor-args" placeholder="e.g., --dangerously-skip-permissions">
-      </div>
-      <div class="editor-row">
-        <label>Allow Extra:</label>
-        <input type="checkbox" id="editor-allow-extra" checked>
-        <span style="font-size:10px;color:#888;">Allow extra args on spawn</span>
-      </div>
-      <div class="editor-buttons">
-        <button id="save-profile-btn">Save</button>
-        <button id="cancel-profile-btn">Cancel</button>
-      </div>
-    </div>
+  <div id="app-container">
+    <!-- Left Rail -->
+    <nav id="left-rail">
+      <section class="rail-section" id="profiles-section">
+        <div class="rail-add-btn" id="add-profile-btn" data-tooltip="Add Profile">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M8 3v10M3 8h10"/>
+          </svg>
+        </div>
+      </section>
+      <div class="rail-separator"></div>
+      <section class="rail-section" id="sessions-section">
+        <div class="rail-add-btn" id="new-session-btn" data-tooltip="New Session">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="2" y="3" width="12" height="10" rx="1"/>
+            <path d="M5 8l2 2-2 2"/>
+            <path d="M9 10h3"/>
+          </svg>
+        </div>
+      </section>
+    </nav>
     
-    <!-- Profile list -->
-    <ul id="profile-list"></ul>
-    <button id="add-profile-btn">+ Add Profile</button>
-    
-    <!-- Spawn row -->
-    <div id="spawn-row">
-      <select id="profile-select">
-        <option value="">Select profile...</option>
-      </select>
-      <input 
-        type="text" 
-        id="extra-args-input" 
-        placeholder="Extra args..."
-        autocomplete="off"
-        spellcheck="false"
-      >
-      <button id="spawn-btn" disabled>Run</button>
-    </div>
+    <!-- Main Panel -->
+    <main id="main-panel">
+      <!-- Top Bar -->
+      <header id="top-bar">
+        <span id="active-label">No active session</span>
+        <div id="top-bar-actions">
+          <button class="topbar-btn" id="btn-new" title="New Session" disabled>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M8 3v10M3 8h10"/>
+            </svg>
+          </button>
+          <button class="topbar-btn" id="btn-restart" title="Restart" disabled>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5"/>
+              <path d="M8 2.5V0.5l2.5 2-2.5 2"/>
+            </svg>
+          </button>
+          <button class="topbar-btn" id="btn-kill" title="Kill" disabled>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M4 4l8 8M12 4l-8 8"/>
+            </svg>
+          </button>
+          <button class="topbar-btn" id="btn-clear" title="Clear" disabled>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <rect x="2" y="3" width="12" height="10" rx="1"/>
+              <path d="M2 6h12"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+      
+      <!-- Terminal Surface -->
+      <div id="terminal-surface">
+        <div id="empty-state">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1">
+            <rect x="2" y="3" width="12" height="10" rx="1"/>
+            <path d="M5 8l2 2-2 2"/>
+            <path d="M9 10h3"/>
+          </svg>
+          <p>No sessions yet</p>
+        </div>
+      </div>
+      
+      <!-- New Session Modal -->
+      <div id="modal-new-session" class="modal-overlay hidden">
+        <div class="modal-content">
+          <h3>New Session</h3>
+          <div id="ascii-preview" class="ascii-preview hidden">
+            <pre id="ascii-art"></pre>
+          </div>
+          <div class="modal-field">
+            <label>Profile</label>
+            <select id="modal-profile-select">
+              <option value="">Select a profile...</option>
+            </select>
+          </div>
+          <div class="modal-field" id="modal-extra-args-field">
+            <label>Extra Arguments (optional)</label>
+            <input type="text" id="modal-extra-args" placeholder="--flag value">
+          </div>
+          <div class="modal-actions">
+            <button class="modal-btn secondary" id="modal-new-cancel">Cancel</button>
+            <button class="modal-btn primary" id="modal-new-run" disabled>Run</button>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Profile Editor Modal -->
+      <div id="modal-profile-editor" class="modal-overlay hidden">
+        <div class="modal-content">
+          <h3 id="modal-profile-title">New Profile</h3>
+          <div class="modal-field">
+            <label>Label</label>
+            <input type="text" id="modal-editor-label" placeholder="e.g., Claude Agent">
+          </div>
+          <div class="modal-field">
+            <label>Command <span id="modal-cli-status" class="cli-status"></span></label>
+            <input type="text" id="modal-editor-command" placeholder="e.g., claude">
+            <div id="modal-install-hint" class="install-hint" style="display:none;"></div>
+          </div>
+          <div class="modal-field">
+            <label>Default Arguments</label>
+            <input type="text" id="modal-editor-args" placeholder="e.g., --dangerously-skip-permissions">
+          </div>
+          <div class="modal-checkbox">
+            <input type="checkbox" id="modal-editor-allow-extra" checked>
+            <span>Allow extra arguments on spawn</span>
+          </div>
+          <div class="modal-actions">
+            <button class="modal-btn danger" id="modal-editor-delete" style="display:none;">Delete</button>
+            <div style="flex:1;"></div>
+            <button class="modal-btn secondary" id="modal-editor-cancel">Cancel</button>
+            <button class="modal-btn primary" id="modal-editor-save">Save</button>
+          </div>
+        </div>
+      </div>
+    </main>
   </div>
   
-  <!-- Sessions panel -->
-  <div id="sessions-panel" class="panel">
-    <ul id="session-list"></ul>
-  </div>
-  
-  <div id="error-display"></div>
-  
-  <!-- Terminal container: holds all xterm instances, one visible at a time -->
-  <div id="terminal-container">
-    <div id="empty-state">No sessions. Create a profile and run it above.</div>
-  </div>
+  <!-- Tooltip element -->
+  <div id="tooltip" class="tooltip hidden"></div>
 
-  <!-- xterm.js library -->
-  <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
-  <!-- xterm-addon-fit: auto-resize terminal to container -->
-  <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <!-- Bundled xterm.js -->
+  <script src="${xtermJsUri}"></script>
+  <script src="${xtermFitUri}"></script>
 
   <script nonce="${nonce}">
     (function() {
       // VS Code API for postMessage communication
       const vscode = acquireVsCodeApi();
 
-      // DOM elements - Tabs
-      const tabs = document.querySelectorAll('.tab');
-      const profilesPanel = document.getElementById('profiles-panel');
-      const sessionsPanel = document.getElementById('sessions-panel');
+      // ========== DOM Elements ==========
       
-      // DOM elements - Profile management
-      const profileEditor = document.getElementById('profile-editor');
-      const editorLabel = document.getElementById('editor-label');
-      const editorCommand = document.getElementById('editor-command');
-      const editorArgs = document.getElementById('editor-args');
-      const editorAllowExtra = document.getElementById('editor-allow-extra');
-      const editorCliStatus = document.getElementById('editor-cli-status');
-      const editorInstallHint = document.getElementById('editor-install-hint');
-      const saveProfileBtn = document.getElementById('save-profile-btn');
-      const cancelProfileBtn = document.getElementById('cancel-profile-btn');
+      // Left Rail
+      const leftRail = document.getElementById('left-rail');
+      const profilesSection = document.getElementById('profiles-section');
+      const sessionsSection = document.getElementById('sessions-section');
       const addProfileBtn = document.getElementById('add-profile-btn');
-      const profileList = document.getElementById('profile-list');
-      const profileSelect = document.getElementById('profile-select');
-      const extraArgsInput = document.getElementById('extra-args-input');
-      const spawnBtn = document.getElementById('spawn-btn');
+      const newSessionBtn = document.getElementById('new-session-btn');
       
-      // DOM elements - Sessions
-      const sessionList = document.getElementById('session-list');
-      const terminalContainer = document.getElementById('terminal-container');
+      // Top Bar
+      const activeLabel = document.getElementById('active-label');
+      const btnNew = document.getElementById('btn-new');
+      const btnRestart = document.getElementById('btn-restart');
+      const btnKill = document.getElementById('btn-kill');
+      const btnClear = document.getElementById('btn-clear');
+      
+      // Terminal Surface
+      const terminalSurface = document.getElementById('terminal-surface');
       const emptyState = document.getElementById('empty-state');
-      const errorDisplay = document.getElementById('error-display');
+      
+      // Tooltip
+      const tooltip = document.getElementById('tooltip');
+      
+      // New Session Modal
+      const modalNewSession = document.getElementById('modal-new-session');
+      const modalProfileSelect = document.getElementById('modal-profile-select');
+      const modalExtraArgs = document.getElementById('modal-extra-args');
+      const modalExtraArgsField = document.getElementById('modal-extra-args-field');
+      const modalNewCancel = document.getElementById('modal-new-cancel');
+      const modalNewRun = document.getElementById('modal-new-run');
+      const asciiPreview = document.getElementById('ascii-preview');
+      const asciiArt = document.getElementById('ascii-art');
+      
+      // Profile Editor Modal
+      const modalProfileEditor = document.getElementById('modal-profile-editor');
+      const modalProfileTitle = document.getElementById('modal-profile-title');
+      const modalEditorLabel = document.getElementById('modal-editor-label');
+      const modalEditorCommand = document.getElementById('modal-editor-command');
+      const modalEditorArgs = document.getElementById('modal-editor-args');
+      const modalEditorAllowExtra = document.getElementById('modal-editor-allow-extra');
+      const modalCliStatus = document.getElementById('modal-cli-status');
+      const modalInstallHint = document.getElementById('modal-install-hint');
+      const modalEditorDelete = document.getElementById('modal-editor-delete');
+      const modalEditorCancel = document.getElementById('modal-editor-cancel');
+      const modalEditorSave = document.getElementById('modal-editor-save');
 
       // ========== CLI Discovery ==========
 
-      /**
-       * Install registry - static mapping of commands to install instructions.
-       * macOS only. Advisory only - never auto-installs.
-       */
       const INSTALL_REGISTRY = {
-        'claude': 'brew install claude',
+        'claude': 'npm install -g @anthropic-ai/claude-code',
         'codex': 'npm install -g @openai/codex',
         'aider': 'pip install aider-chat',
         'gh': 'brew install gh',
@@ -1011,42 +1320,231 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         'gradle': 'brew install gradle'
       };
 
-      /**
-       * CLI status cache - stores discovered CLI states.
-       * Key: command name, Value: { installed: boolean, resolvedPath: string|null }
-       */
       const cliStatusCache = new Map();
-
-      /**
-       * Pending CLI checks - tracks commands being checked.
-       */
       const pendingChecks = new Set();
 
+      // ========== ASCII Art Registry ==========
+      
+      // ANSI color codes for terminal rendering
+      const ANSI = {
+        RESET: '\x1b[0m',
+        BLUE: '\x1b[38;5;33m',        // gemini
+        WHITE: '\x1b[38;5;255m',      // codex
+        ORANGE: '\x1b[38;5;208m',     // claude
+        PURPLE: '\x1b[38;5;141m',     // kiro
+        YELLOW: '\x1b[38;5;226m',     // droid
+        NEON_GREEN: '\x1b[38;5;46m'   // kilo
+      };
+
+      const ASCII_REGISTRY = {
+        'claude': {
+          color: ANSI.ORANGE,
+          art: [
+            '   ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗',
+            '  ██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝',
+            '  ██║     ██║     ███████║██║   ██║██║  ██║█████╗  ',
+            '  ██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ',
+            '  ╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗',
+            '   ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝'
+          ]
+        },
+        'gemini': {
+          color: ANSI.BLUE,
+          art: [
+            '   ██████╗ ███████╗███╗   ███╗██╗███╗   ██╗██╗',
+            '  ██╔════╝ ██╔════╝████╗ ████║██║████╗  ██║██║',
+            '  ██║  ███╗█████╗  ██╔████╔██║██║██╔██╗ ██║██║',
+            '  ██║   ██║██╔══╝  ██║╚██╔╝██║██║██║╚██╗██║██║',
+            '  ╚██████╔╝███████╗██║ ╚═╝ ██║██║██║ ╚████║██║',
+            '   ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝'
+          ]
+        },
+        'codex': {
+          color: ANSI.WHITE,
+          art: [
+            '   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗',
+            '  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝',
+            '  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝ ',
+            '  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗ ',
+            '  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗',
+            '   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝'
+          ]
+        },
+        'kiro': {
+          color: ANSI.PURPLE,
+          art: [
+            '  ██╗  ██╗██╗██████╗  ██████╗ ',
+            '  ██║ ██╔╝██║██╔══██╗██╔═══██╗',
+            '  █████╔╝ ██║██████╔╝██║   ██║',
+            '  ██╔═██╗ ██║██╔══██╗██║   ██║',
+            '  ██║  ██╗██║██║  ██║╚██████╔╝',
+            '  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ '
+          ]
+        },
+        'kiro-cli': {
+          color: ANSI.PURPLE,
+          art: [
+            '  ██╗  ██╗██╗██████╗  ██████╗ ',
+            '  ██║ ██╔╝██║██╔══██╗██╔═══██╗',
+            '  █████╔╝ ██║██████╔╝██║   ██║',
+            '  ██╔═██╗ ██║██╔══██╗██║   ██║',
+            '  ██║  ██╗██║██║  ██║╚██████╔╝',
+            '  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ '
+          ]
+        },
+        'droid': {
+          color: ANSI.YELLOW,
+          art: [
+            '  ██████╗ ██████╗  ██████╗ ██╗██████╗ ',
+            '  ██╔══██╗██╔══██╗██╔═══██╗██║██╔══██╗',
+            '  ██║  ██║██████╔╝██║   ██║██║██║  ██║',
+            '  ██║  ██║██╔══██╗██║   ██║██║██║  ██║',
+            '  ██████╔╝██║  ██║╚██████╔╝██║██████╔╝',
+            '  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝ '
+          ]
+        },
+        'kilo': {
+          color: ANSI.NEON_GREEN,
+          art: [
+            '  ██╗  ██╗██╗██╗      ██████╗ ',
+            '  ██║ ██╔╝██║██║     ██╔═══██╗',
+            '  █████╔╝ ██║██║     ██║   ██║',
+            '  ██╔═██╗ ██║██║     ██║   ██║',
+            '  ██║  ██╗██║███████╗╚██████╔╝',
+            '  ╚═╝  ╚═╝╚═╝╚══════╝ ╚═════╝ '
+          ]
+        },
+        'kilo-code': {
+          color: ANSI.NEON_GREEN,
+          art: [
+            '  ██╗  ██╗██╗██╗      ██████╗ ',
+            '  ██║ ██╔╝██║██║     ██╔═══██╗',
+            '  █████╔╝ ██║██║     ██║   ██║',
+            '  ██╔═██╗ ██║██║     ██║   ██║',
+            '  ██║  ██╗██║███████╗╚██████╔╝',
+            '  ╚═╝  ╚═╝╚═╝╚══════╝ ╚═════╝ '
+          ]
+        },
+        'aider': {
+          color: ANSI.NEON_GREEN,
+          art: [
+            '   █████╗ ██╗██████╗ ███████╗██████╗ ',
+            '  ██╔══██╗██║██╔══██╗██╔════╝██╔══██╗',
+            '  ███████║██║██║  ██║█████╗  ██████╔╝',
+            '  ██╔══██║██║██║  ██║██╔══╝  ██╔══██╗',
+            '  ██║  ██║██║██████╔╝███████╗██║  ██║',
+            '  ╚═╝  ╚═╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝'
+          ]
+        }
+      };
+
       /**
-       * Request CLI status check from extension host.
+       * Render ASCII art for a command into the preview element.
+       * Uses ANSI escape sequences for coloring.
        */
+      function renderAsciiArt(command) {
+        const entry = ASCII_REGISTRY[command];
+        
+        if (!entry) {
+          // No ASCII art available - hide preview
+          asciiPreview.classList.add('hidden');
+          asciiArt.textContent = '';
+          return;
+        }
+        
+        // Build colored ASCII art with ANSI codes
+        const coloredArt = entry.color + entry.art.join('\n') + ANSI.RESET;
+        
+        // Convert ANSI codes to HTML spans for display
+        const html = ansiToHtml(coloredArt);
+        asciiArt.innerHTML = html;
+        asciiPreview.classList.remove('hidden');
+      }
+
+      /**
+       * Convert ANSI escape sequences to HTML spans.
+       * Handles 256-color codes (38;5;N format).
+       */
+      function ansiToHtml(text) {
+        // Color mapping for 256-color codes
+        const colors = {
+          33: '#0087ff',   // blue (gemini)
+          255: '#eeeeee',  // white (codex)
+          208: '#ff8700',  // orange (claude)
+          141: '#af87ff',  // purple (kiro)
+          226: '#ffff00',  // yellow (droid)
+          46: '#00ff00'    // neon green (kilo)
+        };
+        
+        let html = '';
+        let currentColor = null;
+        let i = 0;
+        
+        while (i < text.length) {
+          if (text[i] === '\x1b' && text[i + 1] === '[') {
+            // Parse ANSI escape sequence
+            let j = i + 2;
+            while (j < text.length && text[j] !== 'm') {
+              j++;
+            }
+            const code = text.substring(i + 2, j);
+            
+            if (code === '0') {
+              // Reset
+              if (currentColor) {
+                html += '</span>';
+                currentColor = null;
+              }
+            } else if (code.startsWith('38;5;')) {
+              // 256-color foreground
+              const colorNum = parseInt(code.substring(5), 10);
+              if (currentColor) {
+                html += '</span>';
+              }
+              const hexColor = colors[colorNum] || '#888888';
+              html += '<span style="color:' + hexColor + '">';
+              currentColor = hexColor;
+            }
+            
+            i = j + 1;
+          } else {
+            // Escape HTML special characters
+            const char = text[i];
+            if (char === '<') {
+              html += '&lt;';
+            } else if (char === '>') {
+              html += '&gt;';
+            } else if (char === '&') {
+              html += '&amp;';
+            } else {
+              html += char;
+            }
+            i++;
+          }
+        }
+        
+        if (currentColor) {
+          html += '</span>';
+        }
+        
+        return html;
+      }
+
       function checkCommand(command) {
         if (!command || pendingChecks.has(command)) return;
-        
         pendingChecks.add(command);
         vscode.postMessage({ type: 'checkCommand', command });
       }
 
-      /**
-       * Get install hint for a command.
-       */
       function getInstallHint(command) {
         return INSTALL_REGISTRY[command] || null;
       }
 
-      /**
-       * Update CLI status display in profile editor.
-       */
-      function updateEditorCliStatus(command) {
+      function updateModalCliStatus(command) {
         if (!command) {
-          editorCliStatus.textContent = '';
-          editorCliStatus.className = 'cli-status';
-          editorInstallHint.style.display = 'none';
+          modalCliStatus.textContent = '';
+          modalCliStatus.className = 'cli-status';
+          modalInstallHint.style.display = 'none';
           return;
         }
 
@@ -1054,71 +1552,40 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         
         if (cached) {
           if (cached.installed) {
-            editorCliStatus.textContent = 'installed';
-            editorCliStatus.className = 'cli-status installed';
-            editorInstallHint.style.display = 'none';
+            modalCliStatus.textContent = 'installed';
+            modalCliStatus.className = 'cli-status installed';
+            modalInstallHint.style.display = 'none';
           } else {
-            editorCliStatus.textContent = 'missing';
-            editorCliStatus.className = 'cli-status missing';
-            
-            // Show install hint if available
+            modalCliStatus.textContent = 'missing';
+            modalCliStatus.className = 'cli-status missing';
             const hint = getInstallHint(command);
             if (hint) {
-              editorInstallHint.innerHTML = 'Install: <code>' + hint + '</code>';
-              editorInstallHint.style.display = 'block';
+              modalInstallHint.innerHTML = 'Install: <code>' + hint + '</code>';
+              modalInstallHint.style.display = 'block';
             } else {
-              editorInstallHint.style.display = 'none';
+              modalInstallHint.style.display = 'none';
             }
           }
         } else {
-          editorCliStatus.textContent = '...';
-          editorCliStatus.className = 'cli-status checking';
-          editorInstallHint.style.display = 'none';
-          
-          // Request check from extension
+          modalCliStatus.textContent = '...';
+          modalCliStatus.className = 'cli-status checking';
+          modalInstallHint.style.display = 'none';
           checkCommand(command);
         }
       }
 
-      /**
-       * AgentProfile model
-       * Stored in Webview state and persisted to extension globalState
-       * 
-       * @typedef {Object} AgentProfile
-       * @property {string} agentId - Unique identifier
-       * @property {string} label - Display name
-       * @property {string} command - CLI executable
-       * @property {string[]} defaultArgs - Default arguments
-       * @property {boolean} allowExtraArgs - Whether extra args can be added on spawn
-       */
-      
-      // Profile registry - stored in Webview state and persisted
+      // ========== State Management ==========
+
       const profiles = new Map();
       let profileCounter = 0;
-      let editingProfileId = null;  // null = creating new, string = editing existing
+      let editingProfileId = null;
 
-      /**
-       * Session registry - mirrors extension host registry
-       * Each session holds:
-       * - sessionId: unique identifier
-       * - command: the spawned command
-       * - args: arguments passed
-       * - terminal: xterm.js Terminal instance (null for restored sessions)
-       * - fitAddon: FitAddon instance for this terminal (null for restored)
-       * - wrapper: DOM element containing the terminal
-       * - state: 'running' | 'exited'
-       * - outputBuffer: stored output for reference
-       * - restored: boolean indicating if session was restored from persistence
-       */
       const sessions = new Map();
       let activeSessionId = null;
-      let stateRestored = false;  // Track if state has been restored
+      let stateRestored = false;
 
-      // ========== Persistence Functions ==========
+      // ========== Persistence ==========
 
-      /**
-       * Persist all profiles to extension globalState.
-       */
       function persistProfiles() {
         const profilesArray = Array.from(profiles.values()).map(p => ({
           agentId: p.agentId,
@@ -1130,10 +1597,6 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'persistProfiles', profiles: profilesArray });
       }
 
-      /**
-       * Persist all sessions to extension globalState.
-       * Only persists metadata and output snapshot, not PTY handles.
-       */
       function persistSessions() {
         const sessionsArray = Array.from(sessions.values()).map(s => ({
           sessionId: s.sessionId,
@@ -1146,93 +1609,85 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'persistSessions', sessions: sessionsArray });
       }
 
-      /**
-       * Persist active session ID.
-       */
       function persistActiveSession() {
         vscode.postMessage({ type: 'setActiveSession', sessionId: activeSessionId });
       }
 
-      /**
-       * Request persisted state from extension on init.
-       */
       function requestPersistedState() {
         vscode.postMessage({ type: 'requestPersistedState' });
       }
 
-      // ========== Tab Navigation ==========
-      
-      tabs.forEach(tab => {
-        tab.addEventListener('click', () => {
-          const targetTab = tab.dataset.tab;
-          
-          // Update tab active state
-          tabs.forEach(t => t.classList.remove('active'));
-          tab.classList.add('active');
-          
-          // Show/hide panels
-          profilesPanel.classList.toggle('active', targetTab === 'profiles');
-          sessionsPanel.classList.toggle('active', targetTab === 'sessions');
-        });
+      // ========== Tooltip ==========
+
+      function showTooltip(text, x, y) {
+        tooltip.textContent = text;
+        tooltip.style.left = (x + 8) + 'px';
+        tooltip.style.top = y + 'px';
+        tooltip.classList.remove('hidden');
+      }
+
+      function hideTooltip() {
+        tooltip.classList.add('hidden');
+      }
+
+      // Setup tooltip for elements with data-tooltip
+      document.addEventListener('mouseover', (e) => {
+        const target = e.target.closest('[data-tooltip]');
+        if (target) {
+          const rect = target.getBoundingClientRect();
+          showTooltip(target.dataset.tooltip, rect.right, rect.top);
+        }
+      });
+
+      document.addEventListener('mouseout', (e) => {
+        const target = e.target.closest('[data-tooltip]');
+        if (target) {
+          hideTooltip();
+        }
       });
 
       // ========== Profile Management ==========
 
-      /**
-       * Generate unique profile ID.
-       */
       function generateProfileId() {
         return 'profile-' + (++profileCounter) + '-' + Date.now();
       }
 
-      /**
-       * Show profile editor for creating or editing.
-       */
-      function showProfileEditor(profile = null) {
+      function showProfileEditorModal(profile = null) {
         editingProfileId = profile ? profile.agentId : null;
         
-        editorLabel.value = profile ? profile.label : '';
-        editorCommand.value = profile ? profile.command : '';
-        editorArgs.value = profile ? profile.defaultArgs.join(' ') : '';
-        editorAllowExtra.checked = profile ? profile.allowExtraArgs : true;
+        modalProfileTitle.textContent = profile ? 'Edit Profile' : 'New Profile';
+        modalEditorLabel.value = profile ? profile.label : '';
+        modalEditorCommand.value = profile ? profile.command : '';
+        modalEditorArgs.value = profile ? profile.defaultArgs.join(' ') : '';
+        modalEditorAllowExtra.checked = profile ? profile.allowExtraArgs : true;
         
-        // Check CLI status for existing command
-        updateEditorCliStatus(profile ? profile.command : '');
+        modalEditorDelete.style.display = profile ? 'block' : 'none';
         
-        profileEditor.classList.remove('hidden');
-        editorLabel.focus();
+        updateModalCliStatus(profile ? profile.command : '');
+        
+        modalProfileEditor.classList.remove('hidden');
+        modalEditorLabel.focus();
       }
 
-      /**
-       * Hide profile editor.
-       */
-      function hideProfileEditor() {
-        profileEditor.classList.add('hidden');
+      function hideProfileEditorModal() {
+        modalProfileEditor.classList.add('hidden');
         editingProfileId = null;
-        
-        // Clear CLI status display
-        editorCliStatus.textContent = '';
-        editorCliStatus.className = 'cli-status';
-        editorInstallHint.style.display = 'none';
+        modalCliStatus.textContent = '';
+        modalCliStatus.className = 'cli-status';
+        modalInstallHint.style.display = 'none';
       }
 
-      /**
-       * Save profile from editor.
-       */
       function saveProfile() {
-        const label = editorLabel.value.trim();
-        const command = editorCommand.value.trim();
-        const argsStr = editorArgs.value.trim();
-        const allowExtraArgs = editorAllowExtra.checked;
+        const label = modalEditorLabel.value.trim();
+        const command = modalEditorCommand.value.trim();
+        const argsStr = modalEditorArgs.value.trim();
+        const allowExtraArgs = modalEditorAllowExtra.checked;
         
         if (!label || !command) {
-          alert('Label and Command are required');
           return;
         }
         
-        // Parse args string into array (split on whitespace)
         const defaultArgs = argsStr ? argsStr.split(/\\s+/) : [];
-        
         const agentId = editingProfileId || generateProfileId();
         
         const profile = {
@@ -1244,195 +1699,190 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         };
         
         profiles.set(agentId, profile);
-        hideProfileEditor();
-        renderProfileList();
-        renderProfileSelect();
-        
-        // Persist profiles to globalState
+        hideProfileEditorModal();
+        renderRail();
+        updateModalProfileSelect();
         persistProfiles();
       }
 
-      /**
-       * Delete a profile.
-       */
       function deleteProfile(agentId) {
         profiles.delete(agentId);
-        renderProfileList();
-        renderProfileSelect();
-        
-        // Persist profiles to globalState
+        hideProfileEditorModal();
+        renderRail();
+        updateModalProfileSelect();
         persistProfiles();
       }
 
-      /**
-       * Render the profile list UI.
-       * Shows CLI status indicator for each profile.
-       */
-      function renderProfileList() {
-        profileList.innerHTML = '';
-        
-        for (const [agentId, profile] of profiles) {
-          const li = document.createElement('li');
-          li.className = 'profile-item';
-          
-          // CLI status indicator
-          const statusSpan = document.createElement('span');
-          const cached = cliStatusCache.get(profile.command);
-          if (cached) {
-            statusSpan.className = 'cli-status ' + (cached.installed ? 'installed' : 'missing');
-            statusSpan.textContent = cached.installed ? 'OK' : '!';
-            statusSpan.title = cached.installed ? 'Installed: ' + cached.resolvedPath : 'Not installed';
-          } else {
-            statusSpan.className = 'cli-status checking';
-            statusSpan.textContent = '?';
-            statusSpan.title = 'Checking...';
-            // Trigger check if not already cached
-            checkCommand(profile.command);
-          }
-          
-          // Label
-          const labelSpan = document.createElement('span');
-          labelSpan.className = 'profile-label';
-          labelSpan.textContent = profile.label;
-          
-          // Command preview
-          const cmdSpan = document.createElement('span');
-          cmdSpan.className = 'profile-command';
-          const fullCmd = [profile.command, ...profile.defaultArgs].join(' ');
-          cmdSpan.textContent = fullCmd.length > 30 ? fullCmd.substring(0, 30) + '...' : fullCmd;
-          
-          // Edit button
-          const editBtn = document.createElement('button');
-          editBtn.className = 'profile-btn';
-          editBtn.textContent = 'Edit';
-          editBtn.onclick = (e) => {
-            e.stopPropagation();
-            showProfileEditor(profile);
-          };
-          
-          // Delete button
-          const deleteBtn = document.createElement('button');
-          deleteBtn.className = 'profile-btn delete';
-          deleteBtn.textContent = 'Del';
-          deleteBtn.onclick = (e) => {
-            e.stopPropagation();
-            deleteProfile(agentId);
-          };
-          
-          li.appendChild(statusSpan);
-          li.appendChild(labelSpan);
-          li.appendChild(cmdSpan);
-          li.appendChild(editBtn);
-          li.appendChild(deleteBtn);
-          
-          profileList.appendChild(li);
-        }
+      // ========== New Session Modal ==========
+
+      function showNewSessionModal() {
+        updateModalProfileSelect();
+        modalExtraArgs.value = '';
+        modalNewRun.disabled = true;
+        // Reset ASCII preview
+        asciiPreview.classList.add('hidden');
+        asciiArt.textContent = '';
+        modalNewSession.classList.remove('hidden');
+        modalProfileSelect.focus();
       }
 
-      /**
-       * Render the profile select dropdown.
-       */
-      function renderProfileSelect() {
-        // Clear existing options except the placeholder
-        profileSelect.innerHTML = '<option value="">Select profile...</option>';
+      function hideNewSessionModal() {
+        modalNewSession.classList.add('hidden');
+      }
+
+      function updateModalProfileSelect() {
+        modalProfileSelect.innerHTML = '<option value="">Select a profile...</option>';
         
         for (const [agentId, profile] of profiles) {
           const option = document.createElement('option');
           option.value = agentId;
           option.textContent = profile.label;
-          profileSelect.appendChild(option);
-        }
-        
-        updateSpawnButton();
-      }
-
-      /**
-       * Update spawn button enabled state.
-       */
-      function updateSpawnButton() {
-        const selectedId = profileSelect.value;
-        spawnBtn.disabled = !selectedId;
-        
-        // Update extra args input based on profile's allowExtraArgs
-        if (selectedId && profiles.has(selectedId)) {
-          const profile = profiles.get(selectedId);
-          extraArgsInput.disabled = !profile.allowExtraArgs;
-          extraArgsInput.placeholder = profile.allowExtraArgs ? 'Extra args...' : 'Extra args disabled';
-        } else {
-          extraArgsInput.disabled = true;
-          extraArgsInput.placeholder = 'Select a profile first';
+          modalProfileSelect.appendChild(option);
         }
       }
 
-      /**
-       * Spawn a session from the selected profile.
-       */
-      function spawnFromProfile() {
-        const agentId = profileSelect.value;
+      function spawnFromModal() {
+        const agentId = modalProfileSelect.value;
         if (!agentId || !profiles.has(agentId)) return;
         
         const profile = profiles.get(agentId);
-        
-        // Build final args: defaultArgs + extraArgs
-        const extraArgsStr = extraArgsInput.value.trim();
+        const extraArgsStr = modalExtraArgs.value.trim();
         const extraArgs = extraArgsStr ? extraArgsStr.split(/\\s+/) : [];
         const finalArgs = [...profile.defaultArgs, ...extraArgs];
         
-        // Send spawnSessionWithArgs message
-        errorDisplay.style.display = 'none';
         vscode.postMessage({
           type: 'spawnSessionWithArgs',
           command: profile.command,
           args: finalArgs
         });
         
-        // Clear extra args input
-        extraArgsInput.value = '';
-        
-        // Switch to sessions tab
-        tabs.forEach(t => t.classList.remove('active'));
-        document.querySelector('[data-tab="sessions"]').classList.add('active');
-        profilesPanel.classList.remove('active');
-        sessionsPanel.classList.add('active');
+        hideNewSessionModal();
       }
 
-      // Profile event listeners
-      addProfileBtn.addEventListener('click', () => showProfileEditor(null));
-      saveProfileBtn.addEventListener('click', saveProfile);
-      cancelProfileBtn.addEventListener('click', hideProfileEditor);
-      profileSelect.addEventListener('change', updateSpawnButton);
-      spawnBtn.addEventListener('click', spawnFromProfile);
-      
-      // Check CLI status when command input changes (debounced)
-      let commandCheckTimeout = null;
-      editorCommand.addEventListener('input', () => {
-        clearTimeout(commandCheckTimeout);
-        commandCheckTimeout = setTimeout(() => {
-          updateEditorCliStatus(editorCommand.value.trim());
-        }, 300);
-      });
-      
-      extraArgsInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          spawnFromProfile();
+      // ========== Left Rail Rendering ==========
+
+      function renderRail() {
+        // Clear profile items (keep add button)
+        const profileItems = profilesSection.querySelectorAll('.rail-item');
+        profileItems.forEach(item => item.remove());
+        
+        // Add profile items before the add button
+        for (const [agentId, profile] of profiles) {
+          const item = document.createElement('div');
+          item.className = 'rail-item';
+          item.dataset.profileId = agentId;
+          item.dataset.tooltip = profile.label;
+          
+          // Profile icon (person silhouette)
+          item.innerHTML = \`
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="5" r="2.5"/>
+              <path d="M3 14c0-2.5 2-4.5 5-4.5s5 2 5 4.5"/>
+            </svg>
+            <span class="accent-bar"></span>
+          \`;
+          
+          // State indicator for CLI status
+          const cached = cliStatusCache.get(profile.command);
+          const indicator = document.createElement('span');
+          indicator.className = 'state-indicator';
+          if (cached) {
+            indicator.classList.add(cached.installed ? 'installed' : 'missing');
+          }
+          item.appendChild(indicator);
+          
+          // Check CLI if not cached
+          if (!cached) {
+            checkCommand(profile.command);
+          }
+          
+          // Click to edit
+          item.addEventListener('click', () => {
+            showProfileEditorModal(profile);
+          });
+          
+          profilesSection.insertBefore(item, addProfileBtn);
         }
-      });
+        
+        // Clear session items (keep add button)
+        const sessionItems = sessionsSection.querySelectorAll('.rail-item');
+        sessionItems.forEach(item => item.remove());
+        
+        // Add session items before the add button
+        for (const [sessionId, session] of sessions) {
+          const item = document.createElement('div');
+          item.className = 'rail-item';
+          if (sessionId === activeSessionId) item.classList.add('active');
+          item.dataset.sessionId = sessionId;
+          
+          const fullCmd = session.args && session.args.length > 0
+            ? session.command + ' ' + session.args.join(' ')
+            : session.command;
+          item.dataset.tooltip = fullCmd;
+          
+          // Terminal icon
+          item.innerHTML = \`
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <rect x="2" y="3" width="12" height="10" rx="1"/>
+              <path d="M5 7l2 1.5-2 1.5"/>
+              <path d="M9 10h3"/>
+            </svg>
+            <span class="accent-bar"></span>
+          \`;
+          
+          // State indicator
+          const indicator = document.createElement('span');
+          indicator.className = 'state-indicator ' + session.state;
+          item.appendChild(indicator);
+          
+          // Click to switch
+          item.addEventListener('click', () => {
+            switchToSession(sessionId);
+          });
+          
+          sessionsSection.insertBefore(item, newSessionBtn);
+        }
+      }
 
-      // ========== Session Management ==========
+      // ========== Top Bar ==========
 
-      /**
-       * Create a new xterm instance for a session.
-       */
+      function updateTopBar() {
+        if (!activeSessionId || !sessions.has(activeSessionId)) {
+          activeLabel.innerHTML = 'No active session';
+          btnNew.disabled = profiles.size === 0;
+          btnRestart.disabled = true;
+          btnKill.disabled = true;
+          btnClear.disabled = true;
+          return;
+        }
+        
+        const session = sessions.get(activeSessionId);
+        const fullCmd = session.args && session.args.length > 0
+          ? session.command + ' ' + session.args.join(' ')
+          : session.command;
+        
+        const stateBadge = '<span class="state-badge ' + session.state + '">' + session.state + '</span>';
+        activeLabel.innerHTML = stateBadge + fullCmd;
+        
+        btnNew.disabled = profiles.size === 0;
+        btnRestart.disabled = session.state !== 'exited';
+        btnKill.disabled = session.state !== 'running';
+        btnClear.disabled = !session.terminal;
+      }
+
+      // ========== Terminal Management ==========
+
       function createTerminalForSession(sessionId) {
         const terminal = new Terminal({
           cursorBlink: true,
-          fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+          fontFamily: "'SF Mono', Menlo, Monaco, 'Courier New', monospace",
           fontSize: 13,
           theme: {
-            background: '#1e1e1e',
-            foreground: '#d4d4d4',
-            cursor: '#aeafad'
+            background: getComputedStyle(document.body).getPropertyValue('--vscode-editor-background').trim() || '#1e1e1e',
+            foreground: getComputedStyle(document.body).getPropertyValue('--vscode-editor-foreground').trim() || '#d4d4d4',
+            cursor: '#aeafad',
+            cursorAccent: '#1e1e1e',
+            selectionBackground: 'rgba(255, 255, 255, 0.3)'
           }
         });
 
@@ -1442,7 +1892,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         const wrapper = document.createElement('div');
         wrapper.className = 'terminal-wrapper hidden';
         wrapper.id = 'terminal-' + sessionId;
-        terminalContainer.appendChild(wrapper);
+        terminalSurface.appendChild(wrapper);
 
         terminal.open(wrapper);
         
@@ -1457,177 +1907,15 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         return { terminal, fitAddon, wrapper };
       }
 
-      /**
-       * Switch active session.
-       */
-      function switchToSession(sessionId) {
-        if (activeSessionId === sessionId) return;
-        
-        if (activeSessionId && sessions.has(activeSessionId)) {
-          const current = sessions.get(activeSessionId);
-          current.wrapper.classList.add('hidden');
-        }
-
-        const session = sessions.get(sessionId);
-        if (session) {
-          session.wrapper.classList.remove('hidden');
-          activeSessionId = sessionId;
-          
-          setTimeout(() => {
-            session.fitAddon.fit();
-            sendResize(sessionId, session.terminal);
-            session.terminal.focus();
-          }, 10);
-        }
-
-        renderSessionList();
-        emptyState.style.display = 'none';
-        vscode.postMessage({ type: 'focusSession', sessionId });
-      }
-
-      /**
-       * Send resize event for a specific session.
-       */
-      function sendResize(sessionId, terminal) {
-        vscode.postMessage({
-          type: 'resizeSession',
-          sessionId: sessionId,
-          cols: terminal.cols,
-          rows: terminal.rows
-        });
-      }
-
-      /**
-       * Render the session list UI.
-       * Shows command + args for each session.
-       * Exited sessions show restart button instead of kill.
-       */
-      function renderSessionList() {
-        sessionList.innerHTML = '';
-        
-        for (const [sessionId, session] of sessions) {
-          const li = document.createElement('li');
-          li.className = 'session-item';
-          if (sessionId === activeSessionId) li.classList.add('active');
-          if (session.state === 'exited') li.classList.add('exited');
-          
-          const stateBadge = document.createElement('span');
-          stateBadge.className = 'session-state ' + session.state;
-          stateBadge.textContent = session.state;
-          
-          // Display command + args
-          const cmdSpan = document.createElement('span');
-          cmdSpan.className = 'session-command';
-          const fullCmd = session.args && session.args.length > 0
-            ? session.command + ' ' + session.args.join(' ')
-            : session.command;
-          cmdSpan.textContent = fullCmd;
-          
-          // Show restart or kill button based on state
-          if (session.state === 'exited') {
-            const restartBtn = document.createElement('button');
-            restartBtn.className = 'profile-btn';
-            restartBtn.textContent = 'Restart';
-            restartBtn.onclick = (e) => {
-              e.stopPropagation();
-              restartSession(sessionId);
-            };
-            
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'kill-btn';
-            removeBtn.textContent = 'X';
-            removeBtn.onclick = (e) => {
-              e.stopPropagation();
-              removeExitedSession(sessionId);
-            };
-            
-            li.appendChild(stateBadge);
-            li.appendChild(cmdSpan);
-            li.appendChild(restartBtn);
-            li.appendChild(removeBtn);
-          } else {
-            const killBtn = document.createElement('button');
-            killBtn.className = 'kill-btn';
-            killBtn.textContent = 'Kill';
-            killBtn.onclick = (e) => {
-              e.stopPropagation();
-              vscode.postMessage({ type: 'killSession', sessionId });
-            };
-            
-            li.appendChild(stateBadge);
-            li.appendChild(cmdSpan);
-            li.appendChild(killBtn);
-          }
-          
-          li.onclick = () => switchToSession(sessionId);
-          
-          sessionList.appendChild(li);
-        }
-      }
-
-      /**
-       * Restart an exited session - spawns fresh PTY with same command/args.
-       */
-      function restartSession(sessionId) {
-        const session = sessions.get(sessionId);
-        if (!session || session.state !== 'exited') return;
-        
-        // Remove old session
-        removeExitedSession(sessionId);
-        
-        // Spawn fresh PTY with same command/args
-        vscode.postMessage({
-          type: 'spawnSessionWithArgs',
-          command: session.command,
-          args: session.args || []
-        });
-      }
-
-      /**
-       * Remove an exited session from the list.
-       */
-      function removeExitedSession(sessionId) {
-        const session = sessions.get(sessionId);
-        if (!session) return;
-        
-        // Dispose terminal if exists
-        if (session.terminal) {
-          session.terminal.dispose();
-        }
-        if (session.wrapper) {
-          session.wrapper.remove();
-        }
-        
-        sessions.delete(sessionId);
-        
-        // If this was active, switch to another or show empty
-        if (activeSessionId === sessionId) {
-          activeSessionId = null;
-          const remaining = Array.from(sessions.keys());
-          if (remaining.length > 0) {
-            switchToSession(remaining[0]);
-          } else {
-            emptyState.style.display = 'flex';
-          }
-        }
-        
-        renderSessionList();
-        persistSessions();
-      }
-
-      /**
-       * Create a read-only terminal for restored session.
-       * Displays output snapshot but doesn't accept input.
-       */
       function createRestoredTerminal(sessionId, outputSnapshot) {
         const terminal = new Terminal({
           cursorBlink: false,
-          fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+          fontFamily: "'SF Mono', Menlo, Monaco, 'Courier New', monospace",
           fontSize: 13,
-          disableStdin: true,  // Read-only
+          disableStdin: true,
           theme: {
-            background: '#1e1e1e',
-            foreground: '#d4d4d4',
+            background: getComputedStyle(document.body).getPropertyValue('--vscode-editor-background').trim() || '#1e1e1e',
+            foreground: getComputedStyle(document.body).getPropertyValue('--vscode-editor-foreground').trim() || '#d4d4d4',
             cursor: '#aeafad'
           }
         });
@@ -1638,11 +1926,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         const wrapper = document.createElement('div');
         wrapper.className = 'terminal-wrapper hidden';
         wrapper.id = 'terminal-' + sessionId;
-        terminalContainer.appendChild(wrapper);
+        terminalSurface.appendChild(wrapper);
 
         terminal.open(wrapper);
         
-        // Write restored output snapshot
         if (outputSnapshot && outputSnapshot.length > 0) {
           terminal.write(outputSnapshot.join('\\n'));
           terminal.write('\\r\\n\\x1b[90m[Session restored - output is read-only]\\x1b[0m\\r\\n');
@@ -1653,21 +1940,203 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         return { terminal, fitAddon, wrapper };
       }
 
-      // Handle resize for active terminal
+      function switchToSession(sessionId) {
+        if (activeSessionId === sessionId) return;
+        
+        // Hide current terminal (detach pattern - just hide, don't destroy)
+        if (activeSessionId && sessions.has(activeSessionId)) {
+          const current = sessions.get(activeSessionId);
+          if (current.wrapper) {
+            current.wrapper.classList.add('hidden');
+          }
+        }
+
+        const session = sessions.get(sessionId);
+        if (session) {
+          session.wrapper.classList.remove('hidden');
+          activeSessionId = sessionId;
+          
+          // Batch DOM updates with requestAnimationFrame
+          requestAnimationFrame(() => {
+            session.fitAddon.fit();
+            sendResize(sessionId, session.terminal);
+            session.terminal.focus();
+          });
+        }
+
+        renderRail();
+        updateTopBar();
+        emptyState.classList.add('hidden');
+        
+        vscode.postMessage({ type: 'focusSession', sessionId });
+        persistActiveSession();
+      }
+
+      function sendResize(sessionId, terminal) {
+        vscode.postMessage({
+          type: 'resizeSession',
+          sessionId: sessionId,
+          cols: terminal.cols,
+          rows: terminal.rows
+        });
+      }
+
+      function restartSession(sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session || session.state !== 'exited') return;
+        
+        removeSession(sessionId);
+        
+        vscode.postMessage({
+          type: 'spawnSessionWithArgs',
+          command: session.command,
+          args: session.args || []
+        });
+      }
+
+      function killSession(sessionId) {
+        vscode.postMessage({ type: 'killSession', sessionId });
+      }
+
+      function removeSession(sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session) return;
+        
+        if (session.terminal) {
+          session.terminal.dispose();
+        }
+        if (session.wrapper) {
+          session.wrapper.remove();
+        }
+        
+        sessions.delete(sessionId);
+        
+        if (activeSessionId === sessionId) {
+          activeSessionId = null;
+          const remaining = Array.from(sessions.keys());
+          if (remaining.length > 0) {
+            switchToSession(remaining[0]);
+          } else {
+            emptyState.classList.remove('hidden');
+            updateTopBar();
+          }
+        }
+        
+        renderRail();
+        persistSessions();
+      }
+
+      function clearTerminal() {
+        if (activeSessionId && sessions.has(activeSessionId)) {
+          const session = sessions.get(activeSessionId);
+          if (session.terminal) {
+            session.terminal.clear();
+          }
+        }
+      }
+
+      // Handle resize
       const resizeObserver = new ResizeObserver(() => {
         if (activeSessionId && sessions.has(activeSessionId)) {
           const session = sessions.get(activeSessionId);
-          session.fitAddon.fit();
-          sendResize(activeSessionId, session.terminal);
+          requestAnimationFrame(() => {
+            session.fitAddon.fit();
+            sendResize(activeSessionId, session.terminal);
+          });
         }
       });
-      resizeObserver.observe(terminalContainer);
+      resizeObserver.observe(terminalSurface);
+
+      // ========== Event Listeners ==========
+
+      // Add profile button
+      addProfileBtn.addEventListener('click', () => showProfileEditorModal(null));
+      
+      // New session button in rail
+      newSessionBtn.addEventListener('click', () => {
+        if (profiles.size > 0) {
+          showNewSessionModal();
+        } else {
+          showProfileEditorModal(null);
+        }
+      });
+      
+      // Top bar buttons
+      btnNew.addEventListener('click', () => showNewSessionModal());
+      btnRestart.addEventListener('click', () => {
+        if (activeSessionId) restartSession(activeSessionId);
+      });
+      btnKill.addEventListener('click', () => {
+        if (activeSessionId) killSession(activeSessionId);
+      });
+      btnClear.addEventListener('click', clearTerminal);
+      
+      // Profile editor modal
+      modalEditorSave.addEventListener('click', saveProfile);
+      modalEditorCancel.addEventListener('click', hideProfileEditorModal);
+      modalEditorDelete.addEventListener('click', () => {
+        if (editingProfileId) deleteProfile(editingProfileId);
+      });
+      
+      // CLI check on command input (debounced)
+      let commandCheckTimeout = null;
+      modalEditorCommand.addEventListener('input', () => {
+        clearTimeout(commandCheckTimeout);
+        commandCheckTimeout = setTimeout(() => {
+          updateModalCliStatus(modalEditorCommand.value.trim());
+        }, 300);
+      });
+      
+      // New session modal
+      modalNewCancel.addEventListener('click', hideNewSessionModal);
+      modalNewRun.addEventListener('click', spawnFromModal);
+      modalProfileSelect.addEventListener('change', () => {
+        const agentId = modalProfileSelect.value;
+        modalNewRun.disabled = !agentId;
+        
+        if (agentId && profiles.has(agentId)) {
+          const profile = profiles.get(agentId);
+          modalExtraArgsField.style.display = profile.allowExtraArgs ? 'block' : 'none';
+          
+          // Render ASCII art for the selected CLI
+          renderAsciiArt(profile.command);
+        } else {
+          // Hide ASCII art when no profile selected
+          asciiPreview.classList.add('hidden');
+          asciiArt.textContent = '';
+        }
+      });
+      
+      // Enter key in extra args
+      modalExtraArgs.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          spawnFromModal();
+        }
+      });
+      
+      // Close modals on backdrop click
+      modalNewSession.addEventListener('click', (e) => {
+        if (e.target === modalNewSession) hideNewSessionModal();
+      });
+      modalProfileEditor.addEventListener('click', (e) => {
+        if (e.target === modalProfileEditor) hideProfileEditorModal();
+      });
+      
+      // Escape key to close modals
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          if (!modalNewSession.classList.contains('hidden')) {
+            hideNewSessionModal();
+          }
+          if (!modalProfileEditor.classList.contains('hidden')) {
+            hideProfileEditorModal();
+          }
+        }
+      });
 
       // ========== Message Handling ==========
 
-      /**
-       * Handle messages from extension host.
-       */
       window.addEventListener('message', (event) => {
         const message = event.data;
 
@@ -1689,6 +2158,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             });
             
             switchToSession(sessionId);
+            persistSessions();
             break;
           }
 
@@ -1707,69 +2177,46 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             const session = sessions.get(sessionId);
             if (session) {
               session.state = 'exited';
+              session.exitCode = code;
               session.terminal.write('\\r\\n\\x1b[90m[Process exited with code ' + code + ']\\x1b[0m\\r\\n');
-              renderSessionList();
+              renderRail();
+              updateTopBar();
+              persistSessions();
             }
             break;
           }
 
           case 'sessionKilled': {
             const { sessionId } = message;
-            const session = sessions.get(sessionId);
-            if (session) {
-              session.terminal.dispose();
-              session.wrapper.remove();
-              sessions.delete(sessionId);
-              
-              if (activeSessionId === sessionId) {
-                activeSessionId = null;
-                const remaining = Array.from(sessions.keys());
-                if (remaining.length > 0) {
-                  switchToSession(remaining[0]);
-                } else {
-                  emptyState.style.display = 'flex';
-                }
-              }
-              
-              renderSessionList();
-            }
+            removeSession(sessionId);
             break;
           }
 
           case 'error': {
-            errorDisplay.textContent = message.message;
-            errorDisplay.style.display = 'block';
+            console.error('Oracle Dock Error:', message.message);
             break;
           }
 
           case 'ready': {
-            // Request persisted state on init
             requestPersistedState();
             break;
           }
 
           case 'commandStatus': {
-            // CLI Discovery: Update cache with command status from extension
             const { command, installed, resolvedPath } = message;
             
-            // Remove from pending
             pendingChecks.delete(command);
-            
-            // Cache the result
             cliStatusCache.set(command, { installed, resolvedPath });
             
-            // Update editor if this command is currently being edited
-            if (editorCommand.value.trim() === command) {
-              updateEditorCliStatus(command);
+            if (modalEditorCommand.value.trim() === command) {
+              updateModalCliStatus(command);
             }
             
-            // Re-render profile list to update status indicators
-            renderProfileList();
+            renderRail();
             break;
           }
 
           case 'restoreState': {
-            // Persistence: Restore profiles and sessions from globalState
             const { profiles: restoredProfiles, sessions: restoredSessions, activeSessionId: restoredActiveId } = message;
             
             // Restore profiles
@@ -1783,7 +2230,6 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
                   defaultArgs: p.defaultArgs || [],
                   allowExtraArgs: p.allowExtraArgs !== false
                 });
-                // Update profile counter to avoid ID collisions
                 const match = p.agentId.match(/profile-(\\d+)-/);
                 if (match) {
                   profileCounter = Math.max(profileCounter, parseInt(match[1], 10));
@@ -1794,10 +2240,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             // Restore sessions as exited with read-only terminals
             if (restoredSessions && restoredSessions.length > 0) {
               for (const s of restoredSessions) {
-                // Skip if session already exists (shouldn't happen, but safety check)
                 if (sessions.has(s.sessionId)) continue;
                 
-                // Create read-only terminal for restored session
                 const { terminal, fitAddon, wrapper } = createRestoredTerminal(
                   s.sessionId, 
                   s.outputSnapshot || []
@@ -1810,7 +2254,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
                   terminal,
                   fitAddon,
                   wrapper,
-                  state: 'exited',  // Always restore as exited
+                  state: 'exited',
                   exitCode: s.exitCode,
                   outputBuffer: s.outputSnapshot || [],
                   restored: true
@@ -1819,16 +2263,20 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             }
             
             // Render UI
-            renderProfileList();
-            renderProfileSelect();
-            renderSessionList();
+            renderRail();
+            updateTopBar();
+            updateModalProfileSelect();
             
             // Restore active session if valid
             if (restoredActiveId && sessions.has(restoredActiveId)) {
               switchToSession(restoredActiveId);
             } else if (sessions.size > 0) {
-              // Switch to first session if active no longer exists
               switchToSession(Array.from(sessions.keys())[0]);
+            }
+            
+            // Show empty state if no sessions
+            if (sessions.size === 0) {
+              emptyState.classList.remove('hidden');
             }
             
             stateRestored = true;
@@ -1837,9 +2285,12 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         }
       });
 
-      // Initial render (will be updated when restoreState arrives)
-      renderProfileList();
-      renderProfileSelect();
+      // Initial render
+      renderRail();
+      updateTopBar();
+      
+      // Enable new button once profiles exist
+      btnNew.disabled = profiles.size === 0;
     })();
   </script>
 </body>
@@ -1885,4 +2336,4 @@ export function activate(context: vscode.ExtensionContext): void {
  * Extension deactivation.
  * Cleanup is handled by subscription disposal.
  */
-export function deactivate(): void {}
+export function deactivate(): void { }
