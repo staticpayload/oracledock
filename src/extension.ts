@@ -27,30 +27,78 @@ type SessionState = 'running' | 'exited' | 'crashed';
 interface Session {
   sessionId: string;
   command: string;
+  args: string[];         // Arguments passed to the command
   pty: pty.IPty;
   outputBuffer: string[];  // Stores output for replay when switching sessions
   state: SessionState;
   exitCode?: number;
 }
 
+// ========== Persistence Data Models ==========
+
+// Maximum lines to persist per session output snapshot
+const OUTPUT_SNAPSHOT_MAX_LINES = 1000;
+
+// Persisted profile - serializable agent profile
+interface PersistedProfile {
+  agentId: string;
+  label: string;
+  command: string;
+  defaultArgs: string[];
+  allowExtraArgs: boolean;
+}
+
+// Persisted session - serializable session metadata + output snapshot
+// Note: Does NOT include PTY handle (not serializable, not resurrectable)
+interface PersistedSession {
+  sessionId: string;
+  command: string;
+  args: string[];
+  state: SessionState;
+  exitCode?: number;
+  outputSnapshot: string[];  // Last N lines of output
+}
+
+// Full persisted state structure
+interface PersistedState {
+  profiles: PersistedProfile[];
+  sessions: PersistedSession[];
+  activeSessionId: string | null;
+}
+
 // Message types for Webview -> Extension communication
+// spawnSessionWithArgs: New protocol for agent profiles with explicit args array
+// checkCommand: CLI discovery - check if command is installed
+// Persistence: requestPersistedState, persistProfiles, persistSessions, setActiveSession
 interface WebviewMessage {
-  type: 'spawnSession' | 'writeInput' | 'resizeSession' | 'killSession' | 'focusSession';
-  command?: string;       // For 'spawnSession': the CLI command to execute
+  type: 'spawnSession' | 'spawnSessionWithArgs' | 'writeInput' | 'resizeSession' | 'killSession' | 'focusSession' | 'checkCommand' | 'requestPersistedState' | 'persistProfiles' | 'persistSessions' | 'setActiveSession';
+  command?: string;       // For spawn/checkCommand: the CLI command/executable
+  args?: string[];        // For 'spawnSessionWithArgs': arguments array
   sessionId?: string;     // For session-specific operations
   data?: string;          // For 'writeInput': keyboard data from xterm
   cols?: number;          // For 'resizeSession': terminal columns
   rows?: number;          // For 'resizeSession': terminal rows
+  profiles?: PersistedProfile[];   // For 'persistProfiles': profiles to save
+  sessions?: PersistedSession[];   // For 'persistSessions': sessions to save
 }
 
 // Message types for Extension -> Webview communication
+// commandStatus: CLI discovery response - reports installed state and resolved path
+// restoreState: Persistence - sends stored state to Webview on init
 interface ExtensionMessage {
-  type: 'sessionStarted' | 'sessionOutput' | 'sessionExited' | 'sessionKilled' | 'error' | 'ready';
+  type: 'sessionStarted' | 'sessionOutput' | 'sessionExited' | 'sessionKilled' | 'error' | 'ready' | 'commandStatus' | 'restoreState';
   sessionId?: string;     // Session identifier
-  command?: string;       // For 'sessionStarted': the command that was spawned
+  command?: string;       // For 'sessionStarted'/'commandStatus': the command
+  args?: string[];        // For 'sessionStarted': the arguments passed
   data?: string;          // For 'sessionOutput': PTY output chunk
   code?: number;          // For 'sessionExited': process exit code
   message?: string;       // For 'error': error description
+  installed?: boolean;    // For 'commandStatus': whether command is installed
+  resolvedPath?: string;  // For 'commandStatus': full path to executable (null if not installed)
+  // Persistence fields for 'restoreState'
+  profiles?: PersistedProfile[];
+  sessions?: PersistedSession[];
+  activeSessionId?: string | null;
 }
 
 /**
@@ -62,6 +110,9 @@ interface ExtensionMessage {
  */
 class OracleDockViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'oracledock.sidebarView';
+  
+  // Storage key for globalState persistence
+  private static readonly STORAGE_KEY = 'oracledock.persistedState';
 
   private _view?: vscode.WebviewView;
   
@@ -72,7 +123,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   // Counter for generating unique session IDs
   private _sessionCounter = 0;
 
-  constructor(private readonly _extensionUri: vscode.Uri) {}
+  constructor(
+    private readonly _extensionUri: vscode.Uri,
+    private readonly _context: vscode.ExtensionContext
+  ) {}
 
   /**
    * Called when the Webview becomes visible.
@@ -113,7 +167,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   /**
    * Handle incoming messages from Webview.
    * Protocol:
-   * - spawnSession: Create new PTY session with command
+   * - spawnSession: Create new PTY session with command (legacy, parses args from string)
+   * - spawnSessionWithArgs: Create new PTY session with explicit command + args array
    * - writeInput: Forward keyboard input to specific session's PTY
    * - resizeSession: Adjust specific session's PTY dimensions
    * - killSession: Terminate specific session
@@ -122,8 +177,17 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   private _handleMessage(message: WebviewMessage): void {
     switch (message.type) {
       case 'spawnSession':
+        // Legacy: parse command string into executable + args
         if (message.command) {
-          this._spawnSession(message.command);
+          const parts = message.command.trim().split(/\s+/);
+          this._spawnSessionWithArgs(parts[0], parts.slice(1));
+        }
+        break;
+
+      case 'spawnSessionWithArgs':
+        // New: explicit command + args array from agent profiles
+        if (message.command) {
+          this._spawnSessionWithArgs(message.command, message.args || []);
         }
         break;
 
@@ -157,7 +221,179 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         // No action needed on extension side - Webview handles xterm switching
         // Session output is already buffered and replayed client-side
         break;
+
+      case 'checkCommand':
+        // CLI Discovery: Check if command is installed via PATH resolution
+        if (message.command) {
+          this._checkCommandInstalled(message.command);
+        }
+        break;
+
+      case 'requestPersistedState':
+        // Persistence: Load and send stored state to Webview
+        this._sendPersistedState();
+        break;
+
+      case 'persistProfiles':
+        // Persistence: Save profiles to globalState
+        if (message.profiles) {
+          this._persistProfiles(message.profiles);
+        }
+        break;
+
+      case 'persistSessions':
+        // Persistence: Save sessions to globalState
+        if (message.sessions) {
+          this._persistSessions(message.sessions);
+        }
+        break;
+
+      case 'setActiveSession':
+        // Persistence: Save active session ID to globalState
+        this._persistActiveSession(message.sessionId || null);
+        break;
     }
+  }
+
+  /**
+   * Check if a command is installed and resolve its path.
+   * Uses 'which' on macOS to resolve command location via PATH.
+   * 
+   * Discovery rules:
+   * - Resolve commands using PATH only
+   * - No scanning of dot folders
+   * - No inference from config presence
+   * - Installed = executable is resolvable and executable
+   */
+  private _checkCommandInstalled(command: string): void {
+    const { execSync } = require('child_process');
+    
+    try {
+      // Use 'which' to resolve command path - macOS first
+      const resolvedPath = execSync(`which ${command}`, { 
+        encoding: 'utf8',
+        timeout: 5000  // 5 second timeout to avoid hangs
+      }).trim();
+      
+      // Command found - report as installed
+      this._postMessage({
+        type: 'commandStatus',
+        command,
+        installed: true,
+        resolvedPath
+      });
+    } catch {
+      // Command not found - report as not installed
+      this._postMessage({
+        type: 'commandStatus',
+        command,
+        installed: false,
+        resolvedPath: undefined
+      });
+    }
+  }
+
+  // ========== Persistence Methods ==========
+
+  /**
+   * Load persisted state from globalState and send to Webview.
+   * Called when Webview requests state on init.
+   */
+  private _sendPersistedState(): void {
+    const state = this._context.globalState.get<PersistedState>(
+      OracleDockViewProvider.STORAGE_KEY
+    );
+
+    // Send stored state or empty defaults
+    this._postMessage({
+      type: 'restoreState',
+      profiles: state?.profiles || [],
+      sessions: state?.sessions || [],
+      activeSessionId: state?.activeSessionId || null
+    });
+  }
+
+  /**
+   * Persist profiles to globalState.
+   */
+  private _persistProfiles(profiles: PersistedProfile[]): void {
+    const state = this._context.globalState.get<PersistedState>(
+      OracleDockViewProvider.STORAGE_KEY
+    ) || { profiles: [], sessions: [], activeSessionId: null };
+
+    state.profiles = profiles;
+    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+  }
+
+  /**
+   * Persist sessions to globalState.
+   * Sessions are stored with output snapshots (trimmed to max lines).
+   */
+  private _persistSessions(sessions: PersistedSession[]): void {
+    const state = this._context.globalState.get<PersistedState>(
+      OracleDockViewProvider.STORAGE_KEY
+    ) || { profiles: [], sessions: [], activeSessionId: null };
+
+    // Ensure output snapshots don't exceed max size
+    const trimmedSessions = sessions.map(s => ({
+      ...s,
+      outputSnapshot: s.outputSnapshot.slice(-OUTPUT_SNAPSHOT_MAX_LINES)
+    }));
+
+    state.sessions = trimmedSessions;
+    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+  }
+
+  /**
+   * Persist active session ID to globalState.
+   */
+  private _persistActiveSession(sessionId: string | null): void {
+    const state = this._context.globalState.get<PersistedState>(
+      OracleDockViewProvider.STORAGE_KEY
+    ) || { profiles: [], sessions: [], activeSessionId: null };
+
+    state.activeSessionId = sessionId;
+    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+  }
+
+  /**
+   * Create output snapshot from live session.
+   * Trims to max lines and returns serializable array.
+   */
+  private _createOutputSnapshot(session: Session): string[] {
+    // Join buffer into single string, split by lines, trim to max
+    const fullOutput = session.outputBuffer.join('');
+    const lines = fullOutput.split('\n');
+    return lines.slice(-OUTPUT_SNAPSHOT_MAX_LINES);
+  }
+
+  /**
+   * Persist current session state (called on session exit).
+   * Updates the stored session with final state and output snapshot.
+   */
+  private _persistSessionState(session: Session): void {
+    const state = this._context.globalState.get<PersistedState>(
+      OracleDockViewProvider.STORAGE_KEY
+    ) || { profiles: [], sessions: [], activeSessionId: null };
+
+    // Find or create session entry
+    const existingIndex = state.sessions.findIndex(s => s.sessionId === session.sessionId);
+    const persistedSession: PersistedSession = {
+      sessionId: session.sessionId,
+      command: session.command,
+      args: session.args,
+      state: session.state,
+      exitCode: session.exitCode,
+      outputSnapshot: this._createOutputSnapshot(session)
+    };
+
+    if (existingIndex >= 0) {
+      state.sessions[existingIndex] = persistedSession;
+    } else {
+      state.sessions.push(persistedSession);
+    }
+
+    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
   }
 
   /**
@@ -169,37 +405,32 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Spawn a new PTY session with the given command.
+   * Spawn a new PTY session with explicit command and args array.
    * 
    * Design decisions:
    * - Each session gets a unique sessionId
    * - Same command can be spawned multiple times (no reuse)
    * - Uses 'which' to verify command exists in PATH
-   * - No shell wrapping: spawns command directly
+   * - No shell wrapping: spawns command directly with args array
    * - Inherits process.env unchanged
    * - cwd is user HOME
    * - Output buffered for replay when switching sessions
+   * - Args passed directly to node-pty (no shell expansion)
    */
-  private _spawnSession(command: string): void {
+  private _spawnSessionWithArgs(command: string, args: string[]): void {
     const sessionId = this._generateSessionId();
-
-    // Parse command into executable and arguments
-    // Simple split on whitespace - no shell expansion
-    const parts = command.trim().split(/\s+/);
-    const executable = parts[0];
-    const args = parts.slice(1);
 
     // Verify executable exists in PATH
     // Using 'which' because we're macOS-first
     const { execSync } = require('child_process');
     let resolvedPath: string;
     try {
-      resolvedPath = execSync(`which ${executable}`, { encoding: 'utf8' }).trim();
+      resolvedPath = execSync(`which ${command}`, { encoding: 'utf8' }).trim();
     } catch {
       this._postMessage({
         type: 'error',
         sessionId,
-        message: `Command not found: ${executable}`
+        message: `Command not found: ${command}`
       });
       return;
     }
@@ -207,7 +438,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     try {
       // Spawn PTY with:
       // - Resolved executable path (from which)
-      // - Original arguments
+      // - Args array passed directly (no shell parsing)
       // - User's HOME as working directory
       // - Unmodified environment (process.env passed directly)
       // - Default terminal size (will be resized by Webview)
@@ -219,10 +450,11 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         env: process.env as { [key: string]: string }  // Unmodified environment
       });
 
-      // Create session object
+      // Create session object with command and args stored separately
       const session: Session = {
         sessionId,
         command,
+        args,
         pty: ptyProcess,
         outputBuffer: [],
         state: 'running'
@@ -231,11 +463,12 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       // Register session
       this._sessions.set(sessionId, session);
 
-      // Notify Webview of new session
+      // Notify Webview of new session with command and args
       this._postMessage({
         type: 'sessionStarted',
         sessionId,
-        command
+        command,
+        args
       });
 
       // Stream PTY output to Webview and buffer for replay
@@ -255,6 +488,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       ptyProcess.onExit(({ exitCode }) => {
         session.state = 'exited';
         session.exitCode = exitCode;
+        
+        // Persist session state with output snapshot
+        this._persistSessionState(session);
         
         this._postMessage({
           type: 'sessionExited',
@@ -315,42 +551,36 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * Generate the HTML content for the Webview.
    * 
    * Structure:
-   * - Session list panel showing all sessions with switch/kill controls
-   * - Command input for spawning new sessions
-   * - Terminal container for active session's xterm
-   * - Multiple xterm instances maintained in memory, one visible at a time
+   * - Left rail (60px): profiles + sessions icons
+   * - Main panel: top bar (36px) + xterm surface
+   * - Modal overlays for new session and profile editing
    * 
    * Security:
-   * - Uses Content Security Policy to restrict script sources
-   * - xterm.js loaded from CDN (unpkg) - production should bundle locally
+   * - Uses Content Security Policy with local bundled assets
+   * - No CDN dependencies
    */
   private _getHtmlForWebview(webview: vscode.Webview): string {
-    // Nonce for CSP - allows only scripts with this nonce
     const nonce = getNonce();
+    
+    // Get URIs for bundled xterm assets
+    const xtermJsUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.js'));
+    const xtermCssUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.css'));
+    const xtermFitUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm-addon-fit.js'));
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!--
-    Content Security Policy:
-    - default-src 'none': Block all by default
-    - style-src: Allow CDN styles and inline styles (for xterm)
-    - script-src: Allow CDN scripts and nonce'd inline script
-    - font-src: Allow CDN fonts (xterm uses custom fonts)
-    - connect-src: Allow VS Code webview protocol
-  -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
-    style-src https://unpkg.com 'unsafe-inline';
-    script-src https://unpkg.com 'nonce-${nonce}';
-    font-src https://unpkg.com;
+    style-src ${webview.cspSource} 'unsafe-inline';
+    script-src ${webview.cspSource} 'nonce-${nonce}';
+    font-src ${webview.cspSource};
     connect-src ${webview.cspSource};
   ">
   <title>Oracle Dock</title>
-  <!-- xterm.js core styles -->
-  <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
+  <link rel="stylesheet" href="${xtermCssUri}">
   <style>
     /* Minimal functional layout - no polish */
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -364,23 +594,121 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       font-size: 12px;
     }
     
-    /* Session list panel */
-    #session-panel {
+    /* Tab navigation */
+    #tab-bar {
+      display: flex;
       background: #252526;
       border-bottom: 1px solid #3c3c3c;
-      max-height: 150px;
+    }
+    .tab {
+      padding: 6px 12px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      font-size: 11px;
+    }
+    .tab:hover { background: #2a2d2e; }
+    .tab.active { border-bottom-color: #007acc; color: #fff; }
+    
+    /* Panels */
+    .panel { display: none; }
+    .panel.active { display: block; }
+    
+    /* Control panel (profiles + spawn) */
+    #control-panel {
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+      max-height: 200px;
       overflow-y: auto;
     }
     
-    /* Command input row */
-    #input-row {
+    /* Profile list */
+    #profile-list {
+      list-style: none;
+      max-height: 100px;
+      overflow-y: auto;
+    }
+    .profile-item {
+      display: flex;
+      align-items: center;
+      padding: 4px 6px;
+      border-bottom: 1px solid #333;
+      cursor: pointer;
+    }
+    .profile-item:hover { background: #2a2d2e; }
+    .profile-item.selected { background: #094771; }
+    .profile-label {
+      flex: 1;
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .profile-command {
+      font-family: monospace;
+      font-size: 10px;
+      color: #888;
+      margin-left: 8px;
+    }
+    .profile-btn {
+      padding: 2px 6px;
+      margin-left: 4px;
+      background: #3c3c3c;
+      border: none;
+      color: #ccc;
+      cursor: pointer;
+      font-size: 10px;
+    }
+    .profile-btn:hover { background: #4c4c4c; }
+    .profile-btn.delete { background: #5a1d1d; color: #f88; }
+    .profile-btn.delete:hover { background: #7a2d2d; }
+    
+    /* CLI Status indicators */
+    .cli-status {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 2px;
+      margin-left: 4px;
+    }
+    .cli-status.installed { background: #2d5a2d; color: #8f8; }
+    .cli-status.missing { background: #5a4a1d; color: #fa8; }
+    .cli-status.checking { background: #3c3c3c; color: #888; }
+    
+    /* Install hint */
+    .install-hint {
+      font-size: 10px;
+      color: #888;
+      padding: 4px 6px;
+      background: #2a2a2a;
+      border-left: 2px solid #5a4a1d;
+      margin: 4px 6px;
+      font-family: monospace;
+    }
+    .install-hint code {
+      color: #fa8;
+      background: #333;
+      padding: 1px 4px;
+      border-radius: 2px;
+    }
+    
+    /* Spawn row */
+    #spawn-row {
       display: flex;
       padding: 6px;
       gap: 4px;
       border-bottom: 1px solid #3c3c3c;
+      flex-wrap: wrap;
     }
-    #command-input {
+    #profile-select {
+      padding: 4px 8px;
+      background: #3c3c3c;
+      border: 1px solid #555;
+      color: #fff;
+      font-size: 11px;
+      min-width: 120px;
+    }
+    #extra-args-input {
       flex: 1;
+      min-width: 100px;
       padding: 4px 8px;
       background: #3c3c3c;
       border: 1px solid #555;
@@ -388,7 +716,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       font-family: monospace;
       font-size: 12px;
     }
-    #command-input:focus {
+    #extra-args-input:focus, #profile-select:focus {
       outline: 1px solid #007acc;
       border-color: #007acc;
     }
@@ -401,8 +729,76 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
     }
     #spawn-btn:hover { background: #1177bb; }
+    #spawn-btn:disabled { background: #555; cursor: not-allowed; }
+    
+    /* Profile editor */
+    #profile-editor {
+      padding: 6px;
+      border-bottom: 1px solid #3c3c3c;
+      background: #2d2d2d;
+    }
+    #profile-editor.hidden { display: none; }
+    .editor-row {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 4px;
+      align-items: center;
+    }
+    .editor-row label {
+      width: 80px;
+      font-size: 11px;
+    }
+    .editor-row input {
+      flex: 1;
+      padding: 3px 6px;
+      background: #3c3c3c;
+      border: 1px solid #555;
+      color: #fff;
+      font-family: monospace;
+      font-size: 11px;
+    }
+    .editor-row input:focus {
+      outline: 1px solid #007acc;
+      border-color: #007acc;
+    }
+    .editor-row input[type="checkbox"] {
+      flex: none;
+      width: 14px;
+      height: 14px;
+    }
+    .editor-buttons {
+      display: flex;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .editor-buttons button {
+      padding: 4px 10px;
+      border: none;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    #save-profile-btn { background: #0e639c; color: #fff; }
+    #save-profile-btn:hover { background: #1177bb; }
+    #cancel-profile-btn { background: #3c3c3c; color: #ccc; }
+    #cancel-profile-btn:hover { background: #4c4c4c; }
+    #add-profile-btn {
+      padding: 4px 8px;
+      margin: 6px;
+      background: #2d5a2d;
+      border: none;
+      color: #8f8;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    #add-profile-btn:hover { background: #3d6a3d; }
     
     /* Session list */
+    #session-panel {
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+      max-height: 120px;
+      overflow-y: auto;
+    }
     #session-list {
       list-style: none;
     }
@@ -444,7 +840,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     
     /* Terminal container */
     #terminal-container {
-      height: calc(100% - 150px);
+      height: calc(100% - 220px);
       width: 100%;
       position: relative;
     }
@@ -478,18 +874,64 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <!-- Session panel: input + session list -->
-  <div id="session-panel">
-    <div id="input-row">
+  <!-- Tab navigation for Profiles/Sessions views -->
+  <div id="tab-bar">
+    <div class="tab active" data-tab="profiles">Profiles</div>
+    <div class="tab" data-tab="sessions">Sessions</div>
+  </div>
+  
+  <!-- Profiles panel -->
+  <div id="profiles-panel" class="panel active">
+    <!-- Profile editor (hidden by default) -->
+    <div id="profile-editor" class="hidden">
+      <div class="editor-row">
+        <label>Label:</label>
+        <input type="text" id="editor-label" placeholder="e.g., Claude Agent">
+      </div>
+      <div class="editor-row">
+        <label>Command:</label>
+        <input type="text" id="editor-command" placeholder="e.g., claude">
+        <span id="editor-cli-status" class="cli-status checking">...</span>
+      </div>
+      <!-- Install hint shown when CLI is missing -->
+      <div id="editor-install-hint" class="install-hint" style="display:none;"></div>
+      <div class="editor-row">
+        <label>Default Args:</label>
+        <input type="text" id="editor-args" placeholder="e.g., --dangerously-skip-permissions">
+      </div>
+      <div class="editor-row">
+        <label>Allow Extra:</label>
+        <input type="checkbox" id="editor-allow-extra" checked>
+        <span style="font-size:10px;color:#888;">Allow extra args on spawn</span>
+      </div>
+      <div class="editor-buttons">
+        <button id="save-profile-btn">Save</button>
+        <button id="cancel-profile-btn">Cancel</button>
+      </div>
+    </div>
+    
+    <!-- Profile list -->
+    <ul id="profile-list"></ul>
+    <button id="add-profile-btn">+ Add Profile</button>
+    
+    <!-- Spawn row -->
+    <div id="spawn-row">
+      <select id="profile-select">
+        <option value="">Select profile...</option>
+      </select>
       <input 
         type="text" 
-        id="command-input" 
-        placeholder="Enter CLI command..."
+        id="extra-args-input" 
+        placeholder="Extra args..."
         autocomplete="off"
         spellcheck="false"
       >
-      <button id="spawn-btn">+ New</button>
+      <button id="spawn-btn" disabled>Run</button>
     </div>
+  </div>
+  
+  <!-- Sessions panel -->
+  <div id="sessions-panel" class="panel">
     <ul id="session-list"></ul>
   </div>
   
@@ -497,7 +939,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   
   <!-- Terminal container: holds all xterm instances, one visible at a time -->
   <div id="terminal-container">
-    <div id="empty-state">No sessions. Enter a command above.</div>
+    <div id="empty-state">No sessions. Create a profile and run it above.</div>
   </div>
 
   <!-- xterm.js library -->
@@ -510,31 +952,477 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       // VS Code API for postMessage communication
       const vscode = acquireVsCodeApi();
 
-      // DOM elements
-      const commandInput = document.getElementById('command-input');
+      // DOM elements - Tabs
+      const tabs = document.querySelectorAll('.tab');
+      const profilesPanel = document.getElementById('profiles-panel');
+      const sessionsPanel = document.getElementById('sessions-panel');
+      
+      // DOM elements - Profile management
+      const profileEditor = document.getElementById('profile-editor');
+      const editorLabel = document.getElementById('editor-label');
+      const editorCommand = document.getElementById('editor-command');
+      const editorArgs = document.getElementById('editor-args');
+      const editorAllowExtra = document.getElementById('editor-allow-extra');
+      const editorCliStatus = document.getElementById('editor-cli-status');
+      const editorInstallHint = document.getElementById('editor-install-hint');
+      const saveProfileBtn = document.getElementById('save-profile-btn');
+      const cancelProfileBtn = document.getElementById('cancel-profile-btn');
+      const addProfileBtn = document.getElementById('add-profile-btn');
+      const profileList = document.getElementById('profile-list');
+      const profileSelect = document.getElementById('profile-select');
+      const extraArgsInput = document.getElementById('extra-args-input');
       const spawnBtn = document.getElementById('spawn-btn');
+      
+      // DOM elements - Sessions
       const sessionList = document.getElementById('session-list');
       const terminalContainer = document.getElementById('terminal-container');
       const emptyState = document.getElementById('empty-state');
       const errorDisplay = document.getElementById('error-display');
+
+      // ========== CLI Discovery ==========
+
+      /**
+       * Install registry - static mapping of commands to install instructions.
+       * macOS only. Advisory only - never auto-installs.
+       */
+      const INSTALL_REGISTRY = {
+        'claude': 'brew install claude',
+        'codex': 'npm install -g @openai/codex',
+        'aider': 'pip install aider-chat',
+        'gh': 'brew install gh',
+        'node': 'brew install node',
+        'python': 'brew install python',
+        'python3': 'brew install python',
+        'npm': 'brew install node',
+        'npx': 'brew install node',
+        'pip': 'brew install python',
+        'pip3': 'brew install python',
+        'git': 'brew install git',
+        'docker': 'brew install --cask docker',
+        'kubectl': 'brew install kubectl',
+        'aws': 'brew install awscli',
+        'gcloud': 'brew install --cask google-cloud-sdk',
+        'terraform': 'brew install terraform',
+        'cargo': 'brew install rust',
+        'rustc': 'brew install rust',
+        'go': 'brew install go',
+        'java': 'brew install openjdk',
+        'mvn': 'brew install maven',
+        'gradle': 'brew install gradle'
+      };
+
+      /**
+       * CLI status cache - stores discovered CLI states.
+       * Key: command name, Value: { installed: boolean, resolvedPath: string|null }
+       */
+      const cliStatusCache = new Map();
+
+      /**
+       * Pending CLI checks - tracks commands being checked.
+       */
+      const pendingChecks = new Set();
+
+      /**
+       * Request CLI status check from extension host.
+       */
+      function checkCommand(command) {
+        if (!command || pendingChecks.has(command)) return;
+        
+        pendingChecks.add(command);
+        vscode.postMessage({ type: 'checkCommand', command });
+      }
+
+      /**
+       * Get install hint for a command.
+       */
+      function getInstallHint(command) {
+        return INSTALL_REGISTRY[command] || null;
+      }
+
+      /**
+       * Update CLI status display in profile editor.
+       */
+      function updateEditorCliStatus(command) {
+        if (!command) {
+          editorCliStatus.textContent = '';
+          editorCliStatus.className = 'cli-status';
+          editorInstallHint.style.display = 'none';
+          return;
+        }
+
+        const cached = cliStatusCache.get(command);
+        
+        if (cached) {
+          if (cached.installed) {
+            editorCliStatus.textContent = 'installed';
+            editorCliStatus.className = 'cli-status installed';
+            editorInstallHint.style.display = 'none';
+          } else {
+            editorCliStatus.textContent = 'missing';
+            editorCliStatus.className = 'cli-status missing';
+            
+            // Show install hint if available
+            const hint = getInstallHint(command);
+            if (hint) {
+              editorInstallHint.innerHTML = 'Install: <code>' + hint + '</code>';
+              editorInstallHint.style.display = 'block';
+            } else {
+              editorInstallHint.style.display = 'none';
+            }
+          }
+        } else {
+          editorCliStatus.textContent = '...';
+          editorCliStatus.className = 'cli-status checking';
+          editorInstallHint.style.display = 'none';
+          
+          // Request check from extension
+          checkCommand(command);
+        }
+      }
+
+      /**
+       * AgentProfile model
+       * Stored in Webview state and persisted to extension globalState
+       * 
+       * @typedef {Object} AgentProfile
+       * @property {string} agentId - Unique identifier
+       * @property {string} label - Display name
+       * @property {string} command - CLI executable
+       * @property {string[]} defaultArgs - Default arguments
+       * @property {boolean} allowExtraArgs - Whether extra args can be added on spawn
+       */
+      
+      // Profile registry - stored in Webview state and persisted
+      const profiles = new Map();
+      let profileCounter = 0;
+      let editingProfileId = null;  // null = creating new, string = editing existing
 
       /**
        * Session registry - mirrors extension host registry
        * Each session holds:
        * - sessionId: unique identifier
        * - command: the spawned command
-       * - terminal: xterm.js Terminal instance
-       * - fitAddon: FitAddon instance for this terminal
+       * - args: arguments passed
+       * - terminal: xterm.js Terminal instance (null for restored sessions)
+       * - fitAddon: FitAddon instance for this terminal (null for restored)
        * - wrapper: DOM element containing the terminal
        * - state: 'running' | 'exited'
        * - outputBuffer: stored output for reference
+       * - restored: boolean indicating if session was restored from persistence
        */
       const sessions = new Map();
       let activeSessionId = null;
+      let stateRestored = false;  // Track if state has been restored
+
+      // ========== Persistence Functions ==========
+
+      /**
+       * Persist all profiles to extension globalState.
+       */
+      function persistProfiles() {
+        const profilesArray = Array.from(profiles.values()).map(p => ({
+          agentId: p.agentId,
+          label: p.label,
+          command: p.command,
+          defaultArgs: p.defaultArgs,
+          allowExtraArgs: p.allowExtraArgs
+        }));
+        vscode.postMessage({ type: 'persistProfiles', profiles: profilesArray });
+      }
+
+      /**
+       * Persist all sessions to extension globalState.
+       * Only persists metadata and output snapshot, not PTY handles.
+       */
+      function persistSessions() {
+        const sessionsArray = Array.from(sessions.values()).map(s => ({
+          sessionId: s.sessionId,
+          command: s.command,
+          args: s.args || [],
+          state: s.state,
+          exitCode: s.exitCode,
+          outputSnapshot: s.outputBuffer || []
+        }));
+        vscode.postMessage({ type: 'persistSessions', sessions: sessionsArray });
+      }
+
+      /**
+       * Persist active session ID.
+       */
+      function persistActiveSession() {
+        vscode.postMessage({ type: 'setActiveSession', sessionId: activeSessionId });
+      }
+
+      /**
+       * Request persisted state from extension on init.
+       */
+      function requestPersistedState() {
+        vscode.postMessage({ type: 'requestPersistedState' });
+      }
+
+      // ========== Tab Navigation ==========
+      
+      tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+          const targetTab = tab.dataset.tab;
+          
+          // Update tab active state
+          tabs.forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+          
+          // Show/hide panels
+          profilesPanel.classList.toggle('active', targetTab === 'profiles');
+          sessionsPanel.classList.toggle('active', targetTab === 'sessions');
+        });
+      });
+
+      // ========== Profile Management ==========
+
+      /**
+       * Generate unique profile ID.
+       */
+      function generateProfileId() {
+        return 'profile-' + (++profileCounter) + '-' + Date.now();
+      }
+
+      /**
+       * Show profile editor for creating or editing.
+       */
+      function showProfileEditor(profile = null) {
+        editingProfileId = profile ? profile.agentId : null;
+        
+        editorLabel.value = profile ? profile.label : '';
+        editorCommand.value = profile ? profile.command : '';
+        editorArgs.value = profile ? profile.defaultArgs.join(' ') : '';
+        editorAllowExtra.checked = profile ? profile.allowExtraArgs : true;
+        
+        // Check CLI status for existing command
+        updateEditorCliStatus(profile ? profile.command : '');
+        
+        profileEditor.classList.remove('hidden');
+        editorLabel.focus();
+      }
+
+      /**
+       * Hide profile editor.
+       */
+      function hideProfileEditor() {
+        profileEditor.classList.add('hidden');
+        editingProfileId = null;
+        
+        // Clear CLI status display
+        editorCliStatus.textContent = '';
+        editorCliStatus.className = 'cli-status';
+        editorInstallHint.style.display = 'none';
+      }
+
+      /**
+       * Save profile from editor.
+       */
+      function saveProfile() {
+        const label = editorLabel.value.trim();
+        const command = editorCommand.value.trim();
+        const argsStr = editorArgs.value.trim();
+        const allowExtraArgs = editorAllowExtra.checked;
+        
+        if (!label || !command) {
+          alert('Label and Command are required');
+          return;
+        }
+        
+        // Parse args string into array (split on whitespace)
+        const defaultArgs = argsStr ? argsStr.split(/\\s+/) : [];
+        
+        const agentId = editingProfileId || generateProfileId();
+        
+        const profile = {
+          agentId,
+          label,
+          command,
+          defaultArgs,
+          allowExtraArgs
+        };
+        
+        profiles.set(agentId, profile);
+        hideProfileEditor();
+        renderProfileList();
+        renderProfileSelect();
+        
+        // Persist profiles to globalState
+        persistProfiles();
+      }
+
+      /**
+       * Delete a profile.
+       */
+      function deleteProfile(agentId) {
+        profiles.delete(agentId);
+        renderProfileList();
+        renderProfileSelect();
+        
+        // Persist profiles to globalState
+        persistProfiles();
+      }
+
+      /**
+       * Render the profile list UI.
+       * Shows CLI status indicator for each profile.
+       */
+      function renderProfileList() {
+        profileList.innerHTML = '';
+        
+        for (const [agentId, profile] of profiles) {
+          const li = document.createElement('li');
+          li.className = 'profile-item';
+          
+          // CLI status indicator
+          const statusSpan = document.createElement('span');
+          const cached = cliStatusCache.get(profile.command);
+          if (cached) {
+            statusSpan.className = 'cli-status ' + (cached.installed ? 'installed' : 'missing');
+            statusSpan.textContent = cached.installed ? 'OK' : '!';
+            statusSpan.title = cached.installed ? 'Installed: ' + cached.resolvedPath : 'Not installed';
+          } else {
+            statusSpan.className = 'cli-status checking';
+            statusSpan.textContent = '?';
+            statusSpan.title = 'Checking...';
+            // Trigger check if not already cached
+            checkCommand(profile.command);
+          }
+          
+          // Label
+          const labelSpan = document.createElement('span');
+          labelSpan.className = 'profile-label';
+          labelSpan.textContent = profile.label;
+          
+          // Command preview
+          const cmdSpan = document.createElement('span');
+          cmdSpan.className = 'profile-command';
+          const fullCmd = [profile.command, ...profile.defaultArgs].join(' ');
+          cmdSpan.textContent = fullCmd.length > 30 ? fullCmd.substring(0, 30) + '...' : fullCmd;
+          
+          // Edit button
+          const editBtn = document.createElement('button');
+          editBtn.className = 'profile-btn';
+          editBtn.textContent = 'Edit';
+          editBtn.onclick = (e) => {
+            e.stopPropagation();
+            showProfileEditor(profile);
+          };
+          
+          // Delete button
+          const deleteBtn = document.createElement('button');
+          deleteBtn.className = 'profile-btn delete';
+          deleteBtn.textContent = 'Del';
+          deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            deleteProfile(agentId);
+          };
+          
+          li.appendChild(statusSpan);
+          li.appendChild(labelSpan);
+          li.appendChild(cmdSpan);
+          li.appendChild(editBtn);
+          li.appendChild(deleteBtn);
+          
+          profileList.appendChild(li);
+        }
+      }
+
+      /**
+       * Render the profile select dropdown.
+       */
+      function renderProfileSelect() {
+        // Clear existing options except the placeholder
+        profileSelect.innerHTML = '<option value="">Select profile...</option>';
+        
+        for (const [agentId, profile] of profiles) {
+          const option = document.createElement('option');
+          option.value = agentId;
+          option.textContent = profile.label;
+          profileSelect.appendChild(option);
+        }
+        
+        updateSpawnButton();
+      }
+
+      /**
+       * Update spawn button enabled state.
+       */
+      function updateSpawnButton() {
+        const selectedId = profileSelect.value;
+        spawnBtn.disabled = !selectedId;
+        
+        // Update extra args input based on profile's allowExtraArgs
+        if (selectedId && profiles.has(selectedId)) {
+          const profile = profiles.get(selectedId);
+          extraArgsInput.disabled = !profile.allowExtraArgs;
+          extraArgsInput.placeholder = profile.allowExtraArgs ? 'Extra args...' : 'Extra args disabled';
+        } else {
+          extraArgsInput.disabled = true;
+          extraArgsInput.placeholder = 'Select a profile first';
+        }
+      }
+
+      /**
+       * Spawn a session from the selected profile.
+       */
+      function spawnFromProfile() {
+        const agentId = profileSelect.value;
+        if (!agentId || !profiles.has(agentId)) return;
+        
+        const profile = profiles.get(agentId);
+        
+        // Build final args: defaultArgs + extraArgs
+        const extraArgsStr = extraArgsInput.value.trim();
+        const extraArgs = extraArgsStr ? extraArgsStr.split(/\\s+/) : [];
+        const finalArgs = [...profile.defaultArgs, ...extraArgs];
+        
+        // Send spawnSessionWithArgs message
+        errorDisplay.style.display = 'none';
+        vscode.postMessage({
+          type: 'spawnSessionWithArgs',
+          command: profile.command,
+          args: finalArgs
+        });
+        
+        // Clear extra args input
+        extraArgsInput.value = '';
+        
+        // Switch to sessions tab
+        tabs.forEach(t => t.classList.remove('active'));
+        document.querySelector('[data-tab="sessions"]').classList.add('active');
+        profilesPanel.classList.remove('active');
+        sessionsPanel.classList.add('active');
+      }
+
+      // Profile event listeners
+      addProfileBtn.addEventListener('click', () => showProfileEditor(null));
+      saveProfileBtn.addEventListener('click', saveProfile);
+      cancelProfileBtn.addEventListener('click', hideProfileEditor);
+      profileSelect.addEventListener('change', updateSpawnButton);
+      spawnBtn.addEventListener('click', spawnFromProfile);
+      
+      // Check CLI status when command input changes (debounced)
+      let commandCheckTimeout = null;
+      editorCommand.addEventListener('input', () => {
+        clearTimeout(commandCheckTimeout);
+        commandCheckTimeout = setTimeout(() => {
+          updateEditorCliStatus(editorCommand.value.trim());
+        }, 300);
+      });
+      
+      extraArgsInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          spawnFromProfile();
+        }
+      });
+
+      // ========== Session Management ==========
 
       /**
        * Create a new xterm instance for a session.
-       * Terminal is created but not attached to DOM until session becomes active.
        */
       function createTerminalForSession(sessionId) {
         const terminal = new Terminal({
@@ -551,16 +1439,13 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         const fitAddon = new FitAddon.FitAddon();
         terminal.loadAddon(fitAddon);
 
-        // Create wrapper div for this terminal
         const wrapper = document.createElement('div');
         wrapper.className = 'terminal-wrapper hidden';
         wrapper.id = 'terminal-' + sessionId;
         terminalContainer.appendChild(wrapper);
 
-        // Open terminal in wrapper
         terminal.open(wrapper);
         
-        // Forward keyboard input to extension host with sessionId
         terminal.onData(data => {
           vscode.postMessage({ 
             type: 'writeInput', 
@@ -573,25 +1458,21 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       }
 
       /**
-       * Switch active session - detach current, attach new.
-       * Does not restart PTY - just switches DOM visibility.
+       * Switch active session.
        */
       function switchToSession(sessionId) {
         if (activeSessionId === sessionId) return;
         
-        // Hide current active session's terminal
         if (activeSessionId && sessions.has(activeSessionId)) {
           const current = sessions.get(activeSessionId);
           current.wrapper.classList.add('hidden');
         }
 
-        // Show new session's terminal
         const session = sessions.get(sessionId);
         if (session) {
           session.wrapper.classList.remove('hidden');
           activeSessionId = sessionId;
           
-          // Fit and resize
           setTimeout(() => {
             session.fitAddon.fit();
             sendResize(sessionId, session.terminal);
@@ -599,13 +1480,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
           }, 10);
         }
 
-        // Update session list UI
         renderSessionList();
-        
-        // Hide empty state
         emptyState.style.display = 'none';
-        
-        // Notify extension (optional, for future use)
         vscode.postMessage({ type: 'focusSession', sessionId });
       }
 
@@ -623,6 +1499,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
       /**
        * Render the session list UI.
+       * Shows command + args for each session.
+       * Exited sessions show restart button instead of kill.
        */
       function renderSessionList() {
         sessionList.innerHTML = '';
@@ -633,30 +1511,54 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
           if (sessionId === activeSessionId) li.classList.add('active');
           if (session.state === 'exited') li.classList.add('exited');
           
-          // State badge
           const stateBadge = document.createElement('span');
           stateBadge.className = 'session-state ' + session.state;
           stateBadge.textContent = session.state;
           
-          // Command display
+          // Display command + args
           const cmdSpan = document.createElement('span');
           cmdSpan.className = 'session-command';
-          cmdSpan.textContent = session.command;
+          const fullCmd = session.args && session.args.length > 0
+            ? session.command + ' ' + session.args.join(' ')
+            : session.command;
+          cmdSpan.textContent = fullCmd;
           
-          // Kill button
-          const killBtn = document.createElement('button');
-          killBtn.className = 'kill-btn';
-          killBtn.textContent = 'Kill';
-          killBtn.onclick = (e) => {
-            e.stopPropagation();
-            vscode.postMessage({ type: 'killSession', sessionId });
-          };
+          // Show restart or kill button based on state
+          if (session.state === 'exited') {
+            const restartBtn = document.createElement('button');
+            restartBtn.className = 'profile-btn';
+            restartBtn.textContent = 'Restart';
+            restartBtn.onclick = (e) => {
+              e.stopPropagation();
+              restartSession(sessionId);
+            };
+            
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'kill-btn';
+            removeBtn.textContent = 'X';
+            removeBtn.onclick = (e) => {
+              e.stopPropagation();
+              removeExitedSession(sessionId);
+            };
+            
+            li.appendChild(stateBadge);
+            li.appendChild(cmdSpan);
+            li.appendChild(restartBtn);
+            li.appendChild(removeBtn);
+          } else {
+            const killBtn = document.createElement('button');
+            killBtn.className = 'kill-btn';
+            killBtn.textContent = 'Kill';
+            killBtn.onclick = (e) => {
+              e.stopPropagation();
+              vscode.postMessage({ type: 'killSession', sessionId });
+            };
+            
+            li.appendChild(stateBadge);
+            li.appendChild(cmdSpan);
+            li.appendChild(killBtn);
+          }
           
-          li.appendChild(stateBadge);
-          li.appendChild(cmdSpan);
-          li.appendChild(killBtn);
-          
-          // Click to switch
           li.onclick = () => switchToSession(sessionId);
           
           sessionList.appendChild(li);
@@ -664,26 +1566,92 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       }
 
       /**
-       * Spawn a new session with the entered command.
+       * Restart an exited session - spawns fresh PTY with same command/args.
        */
-      function spawnSession() {
-        const command = commandInput.value.trim();
-        if (!command) return;
+      function restartSession(sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session || session.state !== 'exited') return;
         
-        errorDisplay.style.display = 'none';
-        vscode.postMessage({ type: 'spawnSession', command });
-        commandInput.value = '';
+        // Remove old session
+        removeExitedSession(sessionId);
+        
+        // Spawn fresh PTY with same command/args
+        vscode.postMessage({
+          type: 'spawnSessionWithArgs',
+          command: session.command,
+          args: session.args || []
+        });
       }
 
-      // Event listeners
-      commandInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          spawnSession();
+      /**
+       * Remove an exited session from the list.
+       */
+      function removeExitedSession(sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session) return;
+        
+        // Dispose terminal if exists
+        if (session.terminal) {
+          session.terminal.dispose();
         }
-      });
-      
-      spawnBtn.addEventListener('click', spawnSession);
+        if (session.wrapper) {
+          session.wrapper.remove();
+        }
+        
+        sessions.delete(sessionId);
+        
+        // If this was active, switch to another or show empty
+        if (activeSessionId === sessionId) {
+          activeSessionId = null;
+          const remaining = Array.from(sessions.keys());
+          if (remaining.length > 0) {
+            switchToSession(remaining[0]);
+          } else {
+            emptyState.style.display = 'flex';
+          }
+        }
+        
+        renderSessionList();
+        persistSessions();
+      }
+
+      /**
+       * Create a read-only terminal for restored session.
+       * Displays output snapshot but doesn't accept input.
+       */
+      function createRestoredTerminal(sessionId, outputSnapshot) {
+        const terminal = new Terminal({
+          cursorBlink: false,
+          fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+          fontSize: 13,
+          disableStdin: true,  // Read-only
+          theme: {
+            background: '#1e1e1e',
+            foreground: '#d4d4d4',
+            cursor: '#aeafad'
+          }
+        });
+
+        const fitAddon = new FitAddon.FitAddon();
+        terminal.loadAddon(fitAddon);
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'terminal-wrapper hidden';
+        wrapper.id = 'terminal-' + sessionId;
+        terminalContainer.appendChild(wrapper);
+
+        terminal.open(wrapper);
+        
+        // Write restored output snapshot
+        if (outputSnapshot && outputSnapshot.length > 0) {
+          terminal.write(outputSnapshot.join('\\n'));
+          terminal.write('\\r\\n\\x1b[90m[Session restored - output is read-only]\\x1b[0m\\r\\n');
+        } else {
+          terminal.write('\\x1b[90m[No output snapshot available]\\x1b[0m\\r\\n');
+        }
+
+        return { terminal, fitAddon, wrapper };
+      }
 
       // Handle resize for active terminal
       const resizeObserver = new ResizeObserver(() => {
@@ -695,30 +1663,24 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       });
       resizeObserver.observe(terminalContainer);
 
+      // ========== Message Handling ==========
+
       /**
        * Handle messages from extension host.
-       * Multi-session protocol:
-       * - sessionStarted: New session created
-       * - sessionOutput: PTY output for specific session
-       * - sessionExited: Session process terminated
-       * - sessionKilled: Session removed
-       * - error: Error for specific session
-       * - ready: Extension ready
        */
       window.addEventListener('message', (event) => {
         const message = event.data;
 
         switch (message.type) {
           case 'sessionStarted': {
-            const { sessionId, command } = message;
+            const { sessionId, command, args } = message;
             
-            // Create terminal for this session
             const { terminal, fitAddon, wrapper } = createTerminalForSession(sessionId);
             
-            // Register session
             sessions.set(sessionId, {
               sessionId,
               command,
+              args: args || [],
               terminal,
               fitAddon,
               wrapper,
@@ -726,7 +1688,6 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
               outputBuffer: []
             });
             
-            // Auto-switch to new session
             switchToSession(sessionId);
             break;
           }
@@ -735,9 +1696,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             const { sessionId, data } = message;
             const session = sessions.get(sessionId);
             if (session && data) {
-              // Buffer output
               session.outputBuffer.push(data);
-              // Write to terminal
               session.terminal.write(data);
             }
             break;
@@ -758,12 +1717,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             const { sessionId } = message;
             const session = sessions.get(sessionId);
             if (session) {
-              // Dispose terminal
               session.terminal.dispose();
               session.wrapper.remove();
               sessions.delete(sessionId);
               
-              // If this was active, switch to another or show empty
               if (activeSessionId === sessionId) {
                 activeSessionId = null;
                 const remaining = Array.from(sessions.keys());
@@ -786,14 +1743,103 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
           }
 
           case 'ready': {
-            commandInput.focus();
+            // Request persisted state on init
+            requestPersistedState();
+            break;
+          }
+
+          case 'commandStatus': {
+            // CLI Discovery: Update cache with command status from extension
+            const { command, installed, resolvedPath } = message;
+            
+            // Remove from pending
+            pendingChecks.delete(command);
+            
+            // Cache the result
+            cliStatusCache.set(command, { installed, resolvedPath });
+            
+            // Update editor if this command is currently being edited
+            if (editorCommand.value.trim() === command) {
+              updateEditorCliStatus(command);
+            }
+            
+            // Re-render profile list to update status indicators
+            renderProfileList();
+            break;
+          }
+
+          case 'restoreState': {
+            // Persistence: Restore profiles and sessions from globalState
+            const { profiles: restoredProfiles, sessions: restoredSessions, activeSessionId: restoredActiveId } = message;
+            
+            // Restore profiles
+            profiles.clear();
+            if (restoredProfiles && restoredProfiles.length > 0) {
+              for (const p of restoredProfiles) {
+                profiles.set(p.agentId, {
+                  agentId: p.agentId,
+                  label: p.label,
+                  command: p.command,
+                  defaultArgs: p.defaultArgs || [],
+                  allowExtraArgs: p.allowExtraArgs !== false
+                });
+                // Update profile counter to avoid ID collisions
+                const match = p.agentId.match(/profile-(\\d+)-/);
+                if (match) {
+                  profileCounter = Math.max(profileCounter, parseInt(match[1], 10));
+                }
+              }
+            }
+            
+            // Restore sessions as exited with read-only terminals
+            if (restoredSessions && restoredSessions.length > 0) {
+              for (const s of restoredSessions) {
+                // Skip if session already exists (shouldn't happen, but safety check)
+                if (sessions.has(s.sessionId)) continue;
+                
+                // Create read-only terminal for restored session
+                const { terminal, fitAddon, wrapper } = createRestoredTerminal(
+                  s.sessionId, 
+                  s.outputSnapshot || []
+                );
+                
+                sessions.set(s.sessionId, {
+                  sessionId: s.sessionId,
+                  command: s.command,
+                  args: s.args || [],
+                  terminal,
+                  fitAddon,
+                  wrapper,
+                  state: 'exited',  // Always restore as exited
+                  exitCode: s.exitCode,
+                  outputBuffer: s.outputSnapshot || [],
+                  restored: true
+                });
+              }
+            }
+            
+            // Render UI
+            renderProfileList();
+            renderProfileSelect();
+            renderSessionList();
+            
+            // Restore active session if valid
+            if (restoredActiveId && sessions.has(restoredActiveId)) {
+              switchToSession(restoredActiveId);
+            } else if (sessions.size > 0) {
+              // Switch to first session if active no longer exists
+              switchToSession(Array.from(sessions.keys())[0]);
+            }
+            
+            stateRestored = true;
             break;
           }
         }
       });
 
-      // Auto-focus input on load
-      commandInput.focus();
+      // Initial render (will be updated when restoreState arrives)
+      renderProfileList();
+      renderProfileSelect();
     })();
   </script>
 </body>
@@ -820,7 +1866,8 @@ function getNonce(): string {
  */
 export function activate(context: vscode.ExtensionContext): void {
   // Register the WebviewViewProvider for the sidebar
-  const provider = new OracleDockViewProvider(context.extensionUri);
+  // Pass context for globalState persistence
+  const provider = new OracleDockViewProvider(context.extensionUri, context);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
