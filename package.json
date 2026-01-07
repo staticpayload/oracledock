@@ -1,0 +1,40 @@
+{
+  "name": "oracledock",
+  "displayName": "Oracle Dock",
+  "description": "Sidebar terminal with dynamic CLI command input",
+  "version": "0.0.1",
+  "publisher": "oracledock",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "oracledock.sidebarView",
+          "name": "Oracle Dock"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.19.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  }
+}

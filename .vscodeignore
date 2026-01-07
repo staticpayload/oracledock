@@ -1,0 +1,8 @@
+# Exclude from VSIX package
+.vscode/**
+src/**
+node_modules/**
+.gitignore
+tsconfig.json
+esbuild.config.js
+*.map
