@@ -1,66 +1,50 @@
 # Oracle Dock
 
-VS Code extension providing a sidebar terminal with dynamic CLI command input.
+Oracle Dock is a right-sidebar agent CLI dock for VS Code. It launches real system CLIs in parallel sessions and lets you switch between them instantly.
 
-## Features
+## Supported agents
 
-- Sidebar Webview titled "Oracle Dock"
-- User enters any installed CLI command
-- PTY session spawned using node-pty
-- xterm.js terminal rendering with full ANSI support
-- Keyboard input forwarded to PTY
-- Session persists while sidebar is open
+- claude
+- codex
+- gemini
+- droid
+- kiro-cli
+- kilocode
+- opencode
+- aider
+
+## Quick start
+
+1) Install the agent CLI(s) so they are available in your login shell PATH.
+2) Open Oracle Dock in the right sidebar.
+3) Pick an agent from the dropdown and click Launch.
+4) Click a session to switch; click the kill icon and confirm to stop it.
+
+## Behavior
+
+- One PTY per click, no reuse.
+- Command is the agent name, args are empty.
+- CWD is HOME, env is your login shell environment.
+- xterm renders each session and preserves output when you switch.
+- Sessions are scoped per workspace; on reload they restore as exited with buffered output.
+- Missing agents are shown as "Not installed" instead of failing silently.
+
+## What Oracle Dock does not do
+
+- No CLI discovery or PATH scanning.
+- No profiles, presets, or setup screens.
+- No shell wrapping, no env mutation, no telemetry, no remote assets.
 
 ## Development
-
-### Prerequisites
-
-- Node.js 18+
-- npm
-
-### Setup
 
 ```bash
 npm install
 npm run build
 ```
 
-### Running
+Run with VS Code Extension Development Host (F5).
 
-1. Open this folder in VS Code
-2. Press F5 to launch Extension Development Host
-3. In the new VS Code window, find "Oracle Dock" in the Explorer sidebar
-4. Enter a CLI command (e.g., `python`, `node`, `htop`)
+## Troubleshooting
 
-### Architecture
-
-```
-oracledock/
-├── src/
-│   └── extension.ts    # Extension entry, WebviewViewProvider, PTY lifecycle
-├── dist/               # Built output (gitignored)
-├── package.json        # Extension manifest and dependencies
-├── tsconfig.json       # TypeScript configuration
-└── esbuild.config.js   # Build configuration
-```
-
-### Message Protocol
-
-**Webview → Extension:**
-- `spawn`: Request PTY with command string
-- `input`: Forward keyboard data to PTY
-- `resize`: Update PTY dimensions
-
-**Extension → Webview:**
-- `output`: PTY stdout/stderr data
-- `error`: Error message
-- `exit`: Process terminated with exit code
-- `ready`: Extension initialized
-
-## Constraints
-
-- macOS first
-- No shell wrapping
-- Unmodified process.env
-- cwd set to user HOME
-- Single PTY session
+- If an agent shows "Not installed", ensure it is available in your login shell PATH.
+- If the panel is closed, reopen Oracle Dock from the right sidebar.

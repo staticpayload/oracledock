@@ -2,7 +2,7 @@
   "name": "oracledock",
   "displayName": "Oracle Dock",
   "description": "Sidebar terminal with dynamic CLI command input",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "publisher": "oracledock",
   "icon": "media/icon.png",
   "engines": {
@@ -11,11 +11,14 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:oracledock.sidebarView"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "secondarySidebar": [
         {
           "id": "oracledock-sidebar",
           "title": "Oracle Dock",
@@ -36,7 +39,9 @@
   "scripts": {
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.config.js",
-    "watch": "node esbuild.config.js --watch"
+    "watch": "node esbuild.config.js --watch",
+    "postinstall": "node scripts/fix-node-pty-perms.js",
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
@@ -45,7 +50,7 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "node-pty": "^1.0.0",
+    "node-pty": "1.1.0",
     "xterm": "^5.3.0",
     "xterm-addon-fit": "^0.8.0"
   }

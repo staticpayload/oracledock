@@ -18,7 +18,10 @@
 
 import * as vscode from 'vscode';
 import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as pty from 'node-pty';
+import { execFile } from 'child_process';
 
 // ========== SECURITY LIMITS ==========
 // These constants enforce hard limits to prevent resource exhaustion attacks
@@ -42,12 +45,114 @@ const MAX_ARG_LENGTH = 4096;
  *  No paths, no shell metacharacters, no path traversal */
 const COMMAND_REGEX = /^[a-zA-Z0-9_\-]+$/;
 
+/** Supported agent CLIs (hardcoded, always visible) */
+const ALLOWED_AGENTS = new Set([
+  'claude',
+  'codex',
+  'gemini',
+  'droid',
+  'kiro-cli',
+  'kilocode',
+  'opencode',
+  'aider'
+]);
+
+const LOGIN_ENV_TIMEOUT_MS = 5000;
+const LOGIN_ENV_MAX_BUFFER = 1024 * 1024;
+
+let cachedLoginEnv: NodeJS.ProcessEnv | null = null;
+let loginEnvPromise: Promise<NodeJS.ProcessEnv> | null = null;
+
+function parseEnvOutput(output: string): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  const lines = output.split(/\r?\n/);
+  for (const line of lines) {
+    if (!line) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx);
+    const value = line.slice(idx + 1);
+    result[key] = value;
+  }
+  return result;
+}
+
+function resolveLoginShellEnv(): Promise<NodeJS.ProcessEnv> {
+  if (cachedLoginEnv) return Promise.resolve(cachedLoginEnv);
+  if (loginEnvPromise) return loginEnvPromise;
+
+  const shell = process.env.SHELL;
+  if (!shell) {
+    cachedLoginEnv = { ...process.env };
+    return Promise.resolve(cachedLoginEnv);
+  }
+
+  loginEnvPromise = new Promise((resolve) => {
+    execFile(shell, ['-ilc', 'env'], {
+      env: process.env,
+      timeout: LOGIN_ENV_TIMEOUT_MS,
+      maxBuffer: LOGIN_ENV_MAX_BUFFER
+    }, (error, stdout) => {
+      if (error || !stdout) {
+        cachedLoginEnv = { ...process.env };
+        resolve(cachedLoginEnv);
+        return;
+      }
+      const parsed = parseEnvOutput(stdout);
+      cachedLoginEnv = { ...process.env, ...parsed };
+      resolve(cachedLoginEnv);
+    });
+  });
+
+  return loginEnvPromise;
+}
+
+function toSpawnEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
+  const result: { [key: string]: string } = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === 'string') {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function ensureSpawnHelperExecutable(): void {
+  if (process.platform === 'win32') return;
+
+  let moduleRoot: string;
+  try {
+    moduleRoot = path.dirname(require.resolve('node-pty/package.json'));
+  } catch (err) {
+    console.warn('[OracleDock] node-pty package not found for spawn-helper fix:', err);
+    return;
+  }
+
+  const candidates = [
+    path.join(moduleRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
+    path.join(moduleRoot, 'build', 'Release', 'spawn-helper'),
+    path.join(moduleRoot, 'build', 'Debug', 'spawn-helper')
+  ];
+
+  for (const helperPath of candidates) {
+    try {
+      if (!fs.existsSync(helperPath)) continue;
+      const stat = fs.statSync(helperPath);
+      const mode = stat.mode & 0o777;
+      if ((mode & 0o111) === 0) {
+        fs.chmodSync(helperPath, mode | 0o111);
+      }
+    } catch (err) {
+      console.warn(`[OracleDock] Failed to ensure spawn-helper permissions at ${helperPath}:`, err);
+    }
+  }
+}
+
 /** Valid IPC message types from Webview - reject all others */
 const VALID_MESSAGE_TYPES = new Set([
   'spawnSession', 'spawnSessionWithArgs', 'writeInput',
   'resizeSession', 'killSession', 'focusSession',
-  'checkCommand', 'requestPersistedState',
-  'persistProfiles', 'persistSessions', 'setActiveSession'
+  'requestPersistedState', 'persistSessions', 'setActiveSession'
 ]);
 
 // Maximum dimensions for terminal resize to prevent integer overflow
@@ -78,15 +183,6 @@ interface Session {
 // Maximum lines to persist per session output snapshot
 const OUTPUT_SNAPSHOT_MAX_LINES = 1000;
 
-// Persisted profile - serializable agent profile
-interface PersistedProfile {
-  agentId: string;
-  label: string;
-  command: string;
-  defaultArgs: string[];
-  allowExtraArgs: boolean;
-}
-
 // Persisted session - serializable session metadata + output snapshot
 // Note: Does NOT include PTY handle (not serializable, not resurrectable)
 interface PersistedSession {
@@ -100,42 +196,34 @@ interface PersistedSession {
 
 // Full persisted state structure
 interface PersistedState {
-  profiles: PersistedProfile[];
   sessions: PersistedSession[];
   activeSessionId: string | null;
 }
 
 // Message types for Webview -> Extension communication
-// spawnSessionWithArgs: New protocol for agent profiles with explicit args array
-// checkCommand: CLI discovery - check if command is installed
-// Persistence: requestPersistedState, persistProfiles, persistSessions, setActiveSession
+// spawnSessionWithArgs: Launch agent CLI with explicit args array
+// Persistence: requestPersistedState, persistSessions, setActiveSession
 interface WebviewMessage {
-  type: 'spawnSession' | 'spawnSessionWithArgs' | 'writeInput' | 'resizeSession' | 'killSession' | 'focusSession' | 'checkCommand' | 'requestPersistedState' | 'persistProfiles' | 'persistSessions' | 'setActiveSession';
-  command?: string;       // For spawn/checkCommand: the CLI command/executable
+  type: 'spawnSession' | 'spawnSessionWithArgs' | 'writeInput' | 'resizeSession' | 'killSession' | 'focusSession' | 'requestPersistedState' | 'persistSessions' | 'setActiveSession';
+  command?: string;       // For spawn: the CLI command/executable
   args?: string[];        // For 'spawnSessionWithArgs': arguments array
   sessionId?: string;     // For session-specific operations
   data?: string;          // For 'writeInput': keyboard data from xterm
   cols?: number;          // For 'resizeSession': terminal columns
   rows?: number;          // For 'resizeSession': terminal rows
-  profiles?: PersistedProfile[];   // For 'persistProfiles': profiles to save
   sessions?: PersistedSession[];   // For 'persistSessions': sessions to save
 }
 
 // Message types for Extension -> Webview communication
-// commandStatus: CLI discovery response - reports installed state and resolved path
 // restoreState: Persistence - sends stored state to Webview on init
 interface ExtensionMessage {
-  type: 'sessionStarted' | 'sessionOutput' | 'sessionExited' | 'sessionKilled' | 'error' | 'ready' | 'commandStatus' | 'restoreState';
+  type: 'sessionStarted' | 'sessionOutput' | 'sessionExited' | 'sessionKilled' | 'error' | 'ready' | 'restoreState';
   sessionId?: string;     // Session identifier
-  command?: string;       // For 'sessionStarted'/'commandStatus': the command
+  command?: string;       // For 'sessionStarted': the command
   args?: string[];        // For 'sessionStarted': the arguments passed
   data?: string;          // For 'sessionOutput': PTY output chunk
   code?: number;          // For 'sessionExited': process exit code
   message?: string;       // For 'error': error description
-  installed?: boolean;    // For 'commandStatus': whether command is installed
-  resolvedPath?: string;  // For 'commandStatus': full path to executable (null if not installed)
-  // Persistence fields for 'restoreState'
-  profiles?: PersistedProfile[];
   sessions?: PersistedSession[];
   activeSessionId?: string | null;
 }
@@ -150,10 +238,11 @@ interface ExtensionMessage {
 class OracleDockViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'oracledock.sidebarView';
 
-  // Storage key for globalState persistence
+  // Storage key for workspaceState persistence
   private static readonly STORAGE_KEY = 'oracledock.persistedState';
 
   private _view?: vscode.WebviewView;
+  private readonly _launchEnv: NodeJS.ProcessEnv;
 
   // Session registry - maps sessionId to Session object
   // Maintains all active sessions with isolated lifecycles
@@ -161,11 +250,17 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
   // Counter for generating unique session IDs
   private _sessionCounter = 0;
+  private readonly _workspaceKey: string;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
-    private readonly _context: vscode.ExtensionContext
-  ) { }
+    private readonly _context: vscode.ExtensionContext,
+    launchEnv: NodeJS.ProcessEnv
+  ) {
+    this._launchEnv = launchEnv;
+    const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'no-workspace';
+    this._workspaceKey = `${OracleDockViewProvider.STORAGE_KEY}:${workspacePath}`;
+  }
 
   /**
    * Called when the Webview becomes visible.
@@ -219,6 +314,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * - resizeSession: Adjust specific session's PTY dimensions
    * - killSession: Terminate specific session
    * - focusSession: Request session data replay for switching
+   * - requestPersistedState: Restore stored sessions and active session
+   * - persistSessions: Persist session metadata and output snapshots
+   * - setActiveSession: Persist active session ID
    */
   private _handleMessage(message: WebviewMessage): void {
     // SECURITY: Reject null/undefined messages
@@ -249,15 +347,14 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
     switch (message.type) {
       case 'spawnSession':
-        // Legacy: parse command string into executable + args
+        // Direct spawn for agent CLI with empty args
         if (message.command && typeof message.command === 'string') {
-          const parts = message.command.trim().split(/\s+/);
-          this._spawnSessionWithArgs(parts[0], parts.slice(1));
+          this._spawnSessionWithArgs(message.command.trim(), []);
         }
         break;
 
       case 'spawnSessionWithArgs':
-        // New: explicit command + args array from agent profiles
+        // Explicit command + args array for agent launch
         if (message.command && typeof message.command === 'string') {
           const args = Array.isArray(message.args) ? message.args : [];
           this._spawnSessionWithArgs(message.command, args);
@@ -303,133 +400,52 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         // Session output is already buffered and replayed client-side
         break;
 
-      case 'checkCommand':
-        // CLI Discovery: Check if command is installed via PATH resolution
-        if (message.command) {
-          this._checkCommandInstalled(message.command);
-        }
-        break;
-
       case 'requestPersistedState':
         // Persistence: Load and send stored state to Webview
         this._sendPersistedState();
         break;
 
-      case 'persistProfiles':
-        // Persistence: Save profiles to globalState
-        if (message.profiles) {
-          this._persistProfiles(message.profiles);
-        }
-        break;
-
       case 'persistSessions':
-        // Persistence: Save sessions to globalState
+        // Persistence: Save sessions to workspaceState
         if (message.sessions) {
           this._persistSessions(message.sessions);
         }
         break;
 
       case 'setActiveSession':
-        // Persistence: Save active session ID to globalState
+        // Persistence: Save active session ID to workspaceState
         this._persistActiveSession(message.sessionId || null);
         break;
-    }
-  }
-
-  /**
-   * Check if a command is installed and resolve its path.
-   * Uses 'which' on macOS to resolve command location via PATH.
-   * 
-   * SECURITY HARDENING:
-   * - Validates command against alphanumeric whitelist
-   * - Uses execFileSync (no shell) to prevent injection
-   * 
-   * Discovery rules:
-   * - Resolve commands using PATH only
-   * - No scanning of dot folders
-   * - No inference from config presence
-   * - Installed = executable is resolvable and executable
-   */
-  private _checkCommandInstalled(command: string): void {
-    // SECURITY: Validate command before execution
-    if (!command || typeof command !== 'string' || !COMMAND_REGEX.test(command)) {
-      this._postMessage({
-        type: 'commandStatus',
-        command: command || '',
-        installed: false,
-        resolvedPath: undefined
-      });
-      return;
-    }
-
-    // SECURITY: Use execFileSync to avoid shell injection
-    const { execFileSync } = require('child_process');
-
-    try {
-      // execFileSync does NOT use a shell - safe from injection
-      const resolvedPath = execFileSync('which', [command], {
-        encoding: 'utf8',
-        timeout: 5000  // 5 second timeout to avoid hangs
-      }).trim();
-
-      // Command found - report as installed
-      this._postMessage({
-        type: 'commandStatus',
-        command,
-        installed: true,
-        resolvedPath
-      });
-    } catch {
-      // Command not found - report as not installed
-      this._postMessage({
-        type: 'commandStatus',
-        command,
-        installed: false,
-        resolvedPath: undefined
-      });
     }
   }
 
   // ========== Persistence Methods ==========
 
   /**
-   * Load persisted state from globalState and send to Webview.
+   * Load persisted state from workspaceState and send to Webview.
    * Called when Webview requests state on init.
    */
   private _sendPersistedState(): void {
-    const state = this._context.globalState.get<PersistedState>(
-      OracleDockViewProvider.STORAGE_KEY
+    const state = this._context.workspaceState.get<PersistedState>(
+      this._workspaceKey
     );
 
     // Send stored state or empty defaults
     this._postMessage({
       type: 'restoreState',
-      profiles: state?.profiles || [],
       sessions: state?.sessions || [],
       activeSessionId: state?.activeSessionId || null
     });
   }
 
   /**
-   * Persist profiles to globalState.
-   */
-  private _persistProfiles(profiles: PersistedProfile[]): void {
-    const state = this._context.globalState.get<PersistedState>(
-      OracleDockViewProvider.STORAGE_KEY
-    ) || { profiles: [], sessions: [], activeSessionId: null };
-
-    state.profiles = profiles;
-    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
-  }
-
-  /**
-   * Persist sessions to globalState.
+   * Persist sessions to workspaceState.
    * Sessions are stored with output snapshots (trimmed to max lines).
    */
   private _persistSessions(sessions: PersistedSession[]): void {
-    const state = this._context.globalState.get<PersistedState>(
-      OracleDockViewProvider.STORAGE_KEY
-    ) || { profiles: [], sessions: [], activeSessionId: null };
+    const state = this._context.workspaceState.get<PersistedState>(
+      this._workspaceKey
+    ) || { sessions: [], activeSessionId: null };
 
     // Ensure output snapshots don't exceed max size
     const trimmedSessions = sessions.map(s => ({
@@ -438,19 +454,19 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     }));
 
     state.sessions = trimmedSessions;
-    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+    this._context.workspaceState.update(this._workspaceKey, state);
   }
 
   /**
-   * Persist active session ID to globalState.
+   * Persist active session ID to workspaceState.
    */
   private _persistActiveSession(sessionId: string | null): void {
-    const state = this._context.globalState.get<PersistedState>(
-      OracleDockViewProvider.STORAGE_KEY
-    ) || { profiles: [], sessions: [], activeSessionId: null };
+    const state = this._context.workspaceState.get<PersistedState>(
+      this._workspaceKey
+    ) || { sessions: [], activeSessionId: null };
 
     state.activeSessionId = sessionId;
-    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+    this._context.workspaceState.update(this._workspaceKey, state);
   }
 
   /**
@@ -469,9 +485,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * Updates the stored session with final state and output snapshot.
    */
   private _persistSessionState(session: Session): void {
-    const state = this._context.globalState.get<PersistedState>(
-      OracleDockViewProvider.STORAGE_KEY
-    ) || { profiles: [], sessions: [], activeSessionId: null };
+    const state = this._context.workspaceState.get<PersistedState>(
+      this._workspaceKey
+    ) || { sessions: [], activeSessionId: null };
 
     // Find or create session entry
     const existingIndex = state.sessions.findIndex(s => s.sessionId === session.sessionId);
@@ -490,7 +506,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       state.sessions.push(persistedSession);
     }
 
-    this._context.globalState.update(OracleDockViewProvider.STORAGE_KEY, state);
+    this._context.workspaceState.update(this._workspaceKey, state);
   }
 
   /**
@@ -508,16 +524,14 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * - Validates command against alphanumeric whitelist (no shell injection)
    * - Validates argument count and length
    * - Enforces session limit
-   * - Uses execFileSync for 'which' (no shell)
    * - Tracks PTY listeners for cleanup
    * - Bounds output buffer size
    * 
    * Design decisions:
    * - Each session gets a unique sessionId
    * - Same command can be spawned multiple times (no reuse)
-   * - Uses 'which' to verify command exists in PATH
    * - No shell wrapping: spawns command directly with args array
-   * - Inherits process.env unchanged
+   * - Uses login shell environment (merged over process.env)
    * - cwd is user HOME
    * - Output buffered for replay when switching sessions
    * - Args passed directly to node-pty (no shell expansion)
@@ -569,40 +583,29 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const sessionId = this._generateSessionId();
-
-    // Verify executable exists in PATH
-    // SECURITY: Using execFileSync with 'which' as first arg to avoid shell injection
-    const { execFileSync } = require('child_process');
-    let resolvedPath: string;
-    try {
-      // execFileSync does NOT use a shell - command is passed directly
-      resolvedPath = execFileSync('which', [command], {
-        encoding: 'utf8',
-        timeout: 5000  // 5 second timeout
-      }).trim();
-    } catch {
+    if (!ALLOWED_AGENTS.has(command)) {
       this._postMessage({
         type: 'error',
-        sessionId,
-        message: `Command not found: ${command}`
+        message: `Agent CLI not found in PATH: ${command}`
       });
       return;
     }
 
+    const sessionId = this._generateSessionId();
+
     try {
       // Spawn PTY with:
-      // - Resolved executable path (from which)
+      // - Command name (agent CLI)
       // - Args array passed directly (no shell parsing)
       // - User's HOME as working directory
-      // - Unmodified environment (process.env passed directly)
+      // - Login shell environment (merged over process.env)
       // - Default terminal size (will be resized by Webview)
-      const ptyProcess = pty.spawn(resolvedPath, args, {
+      const ptyProcess = pty.spawn(command, args, {
         name: 'xterm-256color',  // Terminal type for ANSI support
         cols: 80,
         rows: 24,
         cwd: os.homedir(),       // User HOME as cwd
-        env: process.env as { [key: string]: string }  // Unmodified environment
+        env: toSpawnEnv(this._launchEnv)
       });
 
       // Create session object with command and args stored separately
@@ -693,10 +696,14 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       session.exitDisposable = exitDisposable;
 
     } catch (err) {
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const notFound = /ENOENT|not found/i.test(rawMessage);
       this._postMessage({
         type: 'error',
         sessionId,
-        message: `Failed to spawn: ${err instanceof Error ? err.message : String(err)}`
+        message: notFound
+          ? `Agent CLI not found in PATH: ${command}`
+          : `Failed to spawn: ${rawMessage}`
       });
     }
   }
@@ -796,9 +803,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * Generate the HTML content for the Webview.
    * 
    * Structure:
-   * - Left rail (60px): profiles + sessions icons
-   * - Main panel: top bar (36px) + xterm surface
-   * - Modal overlays for new session and profile editing
+   * - Left rail (60px): launcher + session icons
+   * - Main panel: top bar (36px) + launcher/sessions surface
    * 
    * Security:
    * - Uses Content Security Policy with local bundled assets
@@ -811,7 +817,16 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     const xtermJsUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.js'));
     const xtermCssUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.css'));
     const xtermFitUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm-addon-fit.js'));
-    const brainLogoUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.png'));
+    const logoUris = {
+      claude: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'Claude_Logo_2023_icon-s5120.ico')).toString(),
+      codex: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'codex.ico')).toString(),
+      gemini: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'gemini-color.ico')).toString(),
+      droid: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'droid.svg')).toString(),
+      'kiro-cli': webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'kiro-cli.svg')).toString(),
+      kilocode: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'kilocode.svg')).toString(),
+      opencode: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'opencode.png')).toString(),
+      aider: webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'ico', 'aider.ico')).toString()
+    };
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -829,1043 +844,378 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   <title>Oracle Dock</title>
   <link rel="stylesheet" href="${xtermCssUri}">
   <style>
-    /* ========== SLEEK UI - Stage 6 ========== */
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    
+
     :root {
-      --rail-width: 60px;
-      --topbar-height: 36px;
       --font-ui: 12px;
       --font-mono: 13px;
-      --radius-overlay: 10px;
     }
-    
-    html, body { 
-      height: 100%; 
-      width: 100%; 
+
+    html, body {
+      height: 100%;
+      width: 100%;
       overflow: hidden;
       background: var(--vscode-editor-background);
       color: var(--vscode-editor-foreground);
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       font-size: var(--font-ui);
     }
-    
-    /* ========== LAYOUT ========== */
-    #app-container {
-      display: flex;
-      height: 100%;
-      width: 100%;
-    }
-    
-    /* Left Rail */
-    #left-rail {
-      width: var(--rail-width);
-      min-width: var(--rail-width);
-      height: 100%;
-      background: var(--vscode-editor-background);
-      border-right: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+
+    #app {
       display: flex;
       flex-direction: column;
+      height: 100%;
+      gap: 12px;
+      padding: 12px;
       overflow: hidden;
     }
-    
-    .rail-section {
+
+    #app-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .section {
       display: flex;
       flex-direction: column;
-      align-items: center;
-      padding: 8px 0;
+      gap: 6px;
+      border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      padding-top: 10px;
     }
-    
-    .rail-section-label {
-      font-size: 9px;
+
+    .section:first-of-type {
+      border-top: none;
+      padding-top: 0;
+    }
+
+    .section-title {
+      font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--vscode-descriptionForeground);
-      margin-bottom: 6px;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      transform: rotate(180deg);
-    }
-    
-    .rail-separator {
-      height: 1px;
-      width: 40px;
-      margin: 4px auto;
-      background: var(--vscode-panel-border, rgba(128,128,128,0.2));
-    }
-    
-    .rail-item {
-      position: relative;
-      width: 40px;
-      height: 40px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      border-radius: 8px;
-      margin: 2px 0;
-      transition: background 0.15s ease;
-    }
-    
-    .rail-item:hover {
-      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
-    }
-    
-    .rail-item.active {
-      background: var(--vscode-list-activeSelectionBackground, rgba(0,122,204,0.3));
-    }
-    
-    .rail-item .accent-bar {
-      position: absolute;
-      left: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 3px;
-      height: 20px;
-      background: var(--vscode-focusBorder);
-      border-radius: 0 2px 2px 0;
-      opacity: 0;
-      transition: opacity 0.15s ease;
-    }
-    
-    .rail-item.active .accent-bar {
-      opacity: 1;
-    }
-    
-    .rail-item .state-indicator {
-      position: absolute;
-      bottom: 6px;
-      right: 6px;
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--vscode-descriptionForeground);
-    }
-    
-    .rail-item .state-indicator.running {
-      background: #4ec9b0;
-    }
-    
-    .rail-item .state-indicator.exited {
-      background: #f14c4c;
-    }
-    
-    .rail-item .state-indicator.installed {
-      background: #4ec9b0;
-    }
-    
-    .rail-item .state-indicator.missing {
-      background: #cca700;
-    }
-    
-    .rail-item svg {
-      width: 20px;
-      height: 20px;
-      color: var(--vscode-editor-foreground);
-      opacity: 0.8;
-    }
-    
-    .rail-item:hover svg {
-      opacity: 1;
-    }
-    
-    .rail-add-btn {
-      width: 40px;
-      height: 40px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      border-radius: 8px;
-      margin: 2px 0;
-      border: 1px dashed var(--vscode-descriptionForeground);
-      opacity: 0.5;
-      transition: all 0.15s ease;
-    }
-    
-    .rail-add-btn:hover {
-      opacity: 1;
-      border-color: var(--vscode-focusBorder);
-    }
-    
-    .rail-add-btn svg {
-      width: 16px;
-      height: 16px;
+      letter-spacing: 0.3px;
       color: var(--vscode-descriptionForeground);
     }
-    
-    /* Main Panel */
-    #main-panel {
+
+    .launcher-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .agent-select {
       flex: 1;
+      height: 32px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      padding: 0 8px;
+      font-size: 13px;
+    }
+
+    .agent-launch {
+      height: 32px;
+      padding: 0 12px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .agent-launch:focus,
+    .agent-select:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+
+    .list {
       display: flex;
       flex-direction: column;
-      height: 100%;
-      min-width: 0;
+      gap: 6px;
     }
-    
-    /* Top Bar */
-    #top-bar {
-      height: var(--topbar-height);
-      min-height: var(--topbar-height);
+
+    #session-list {
+      max-height: 180px;
+      overflow-y: auto;
+    }
+
+    .list-item {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      padding: 0 12px;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
       background: var(--vscode-editor-background);
-      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
-    }
-    
-    #active-label {
-      font-family: 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
-      font-size: var(--font-mono);
       color: var(--vscode-editor-foreground);
+      cursor: pointer;
+      text-align: left;
+      font: inherit;
+    }
+
+    .list-item.active {
+      border-color: var(--vscode-focusBorder);
+      background: var(--vscode-list-activeSelectionBackground, rgba(0, 122, 204, 0.2));
+    }
+
+    .list-item:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+
+    .list-item .label {
+      font-size: 13px;
+    }
+
+    .list-item .state {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+    }
+
+    .logo {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
       overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      flex: 1;
-      margin-right: 12px;
-    }
-    
-    #active-label .state-badge {
-      display: inline-block;
-      font-size: 10px;
-      padding: 2px 6px;
-      border-radius: 4px;
-      margin-right: 8px;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-    
-    #active-label .state-badge.running {
-      background: rgba(78, 201, 176, 0.2);
-      color: #4ec9b0;
-    }
-    
-    #active-label .state-badge.exited {
-      background: rgba(241, 76, 76, 0.2);
-      color: #f14c4c;
-    }
-    
-    #top-bar-actions {
-      display: flex;
-      gap: 4px;
-    }
-    
-    .topbar-btn {
-      width: 28px;
-      height: 28px;
+      background: var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
       display: flex;
       align-items: center;
       justify-content: center;
-      background: transparent;
-      border: none;
+      flex: 0 0 22px;
+    }
+
+    .logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .logo.empty img {
+      display: none;
+    }
+
+    .kill-btn {
+      margin-left: 8px;
+      padding: 2px;
       border-radius: 4px;
-      cursor: pointer;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      background: transparent;
       color: var(--vscode-editor-foreground);
-      opacity: 0.7;
-      transition: all 0.15s ease;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
-    
-    .topbar-btn:hover {
-      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
-      opacity: 1;
+
+    .kill-btn svg {
+      width: 12px;
+      height: 12px;
     }
-    
-    .topbar-btn:disabled {
-      opacity: 0.3;
-      cursor: not-allowed;
+
+    .kill-btn:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
     }
-    
-    .topbar-btn svg {
-      width: 16px;
-      height: 16px;
+
+    .confirm-btn {
+      margin-left: 6px;
+      padding: 2px 6px;
+      font-size: 11px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      background: transparent;
+      color: var(--vscode-editor-foreground);
+      cursor: pointer;
     }
-    
-    /* Terminal Surface */
-    #terminal-surface {
+
+    .confirm-btn.danger {
+      color: var(--vscode-errorForeground, #f14c4c);
+      border-color: var(--vscode-errorForeground, #f14c4c);
+    }
+
+    .empty-state {
+      color: var(--vscode-descriptionForeground);
+      cursor: default;
+    }
+
+    #terminal-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
       flex: 1;
+      min-height: 0;
+      border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      padding-top: 10px;
+    }
+
+    #active-session {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+    }
+
+    #terminal-surface {
       position: relative;
+      flex: 1;
+      min-height: 0;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+      background: var(--vscode-editor-background);
       overflow: hidden;
     }
-    
+
     .terminal-wrapper {
       position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
+      inset: 0;
     }
-    
+
     .terminal-wrapper.hidden {
-      visibility: hidden;
-      pointer-events: none;
-    }
-    
-    /* Empty State */
-    #empty-state {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      color: var(--vscode-descriptionForeground);
-      gap: 12px;
-    }
-    
-    #empty-state .brain-logo {
-      width: 180px;
-      height: auto;
-      opacity: 0.6;
-      filter: grayscale(100%);
-      transition: opacity 0.3s ease, filter 0.3s ease;
-    }
-    
-    #empty-state:hover .brain-logo {
-      opacity: 0.9;
-      filter: grayscale(0%);
-    }
-    
-    #empty-state p {
-      font-size: 16px;
-      font-weight: 500;
-      margin-top: 8px;
-    }
-    
-    #empty-state .empty-hint {
-      font-size: 12px;
-      opacity: 0.6;
-    }
-    
-    #empty-state.hidden {
       display: none;
     }
-    
-    /* ========== MODAL OVERLAYS ========== */
-    .modal-overlay {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background: rgba(0, 0, 0, 0.6);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 100;
-    }
-    
-    .modal-overlay.hidden {
-      display: none;
-    }
-    
-    .modal-content {
-      background: var(--vscode-editor-background);
-      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
-      border-radius: var(--radius-overlay);
-      padding: 20px;
-      min-width: 300px;
-      max-width: 400px;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-    }
-    
-    .modal-content h3 {
-      font-size: 14px;
-      font-weight: 500;
-      margin-bottom: 16px;
-      color: var(--vscode-editor-foreground);
-    }
-    
-    .modal-field {
-      margin-bottom: 12px;
-    }
-    
-    .modal-field label {
-      display: block;
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      margin-bottom: 4px;
-    }
-    
-    .modal-field input,
-    .modal-field select {
-      width: 100%;
+
+    #fatal-error,
+    #ui-error {
       padding: 8px 10px;
-      background: var(--vscode-input-background);
-      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
-      border-radius: 4px;
-      color: var(--vscode-input-foreground);
-      font-size: 12px;
-      font-family: inherit;
-    }
-    
-    .modal-field input:focus,
-    .modal-field select:focus {
-      outline: none;
-      border-color: var(--vscode-focusBorder);
-    }
-    
-    .modal-field input[type="text"] {
-      font-family: 'SF Mono', Menlo, Monaco, monospace;
-    }
-    
-    .modal-field .cli-status {
-      display: inline-block;
-      font-size: 10px;
-      padding: 2px 6px;
-      border-radius: 4px;
-      margin-left: 8px;
-    }
-    
-    .modal-field .cli-status.installed {
-      background: rgba(78, 201, 176, 0.2);
-      color: #4ec9b0;
-    }
-    
-    .modal-field .cli-status.missing {
-      background: rgba(204, 167, 0, 0.2);
-      color: #cca700;
-    }
-    
-    .modal-field .cli-status.checking {
-      color: var(--vscode-descriptionForeground);
-    }
-    
-    .modal-field .install-hint {
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
-      margin-top: 4px;
-      padding: 6px 8px;
-      background: var(--vscode-input-background);
-      border-radius: 4px;
-      font-family: 'SF Mono', Menlo, Monaco, monospace;
-    }
-    
-    .modal-field .install-hint code {
-      color: #cca700;
-    }
-    
-    .modal-checkbox {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    
-    .modal-checkbox input {
-      width: 16px;
-      height: 16px;
-    }
-    
-    .modal-checkbox span {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-    }
-    
-    .modal-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      margin-top: 20px;
-    }
-    
-    /* ASCII Art Preview */
-    .ascii-preview {
-      margin: 16px 0;
-      padding: 12px;
-      background: #0d0d0d;
       border-radius: 6px;
-      overflow-x: auto;
-      min-height: 120px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      border: 1px solid var(--vscode-errorForeground, #f14c4c);
+      color: var(--vscode-errorForeground, #f14c4c);
+      background: rgba(241, 76, 76, 0.08);
     }
-    
-    .ascii-preview pre {
-      margin: 0;
-      font-family: 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
-      font-size: 10px;
-      line-height: 1.1;
-      white-space: pre;
-      text-align: center;
-    }
-    
-    .ascii-preview.hidden {
+
+    #fatal-error.hidden,
+    #ui-error.hidden {
       display: none;
     }
-    
-    .modal-btn {
-      padding: 8px 16px;
-      border: none;
-      border-radius: 4px;
+
+    #fatal-error button {
+      margin-top: 6px;
+      padding: 4px 8px;
       font-size: 12px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-    
-    .modal-btn.primary {
-      background: var(--vscode-button-background, #0e639c);
-      color: var(--vscode-button-foreground, #fff);
-    }
-    
-    .modal-btn.primary:hover {
-      background: var(--vscode-button-hoverBackground, #1177bb);
-    }
-    
-    .modal-btn.secondary {
+      border-radius: 4px;
+      border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
       background: transparent;
       color: var(--vscode-editor-foreground);
-      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
-    }
-    
-    .modal-btn.secondary:hover {
-      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
-    }
-    
-    .modal-btn.danger {
-      background: rgba(241, 76, 76, 0.2);
-      color: #f14c4c;
-    }
-    
-    .modal-btn.danger:hover {
-      background: rgba(241, 76, 76, 0.3);
-    }
-    
-    /* ========== TOOLTIP ========== */
-    .tooltip {
-      position: fixed;
-      background: var(--vscode-editorWidget-background, #252526);
-      color: var(--vscode-editorWidget-foreground, #ccc);
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 11px;
-      pointer-events: none;
-      z-index: 200;
-      border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,0.3));
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-      white-space: nowrap;
-    }
-    
-    .tooltip.hidden {
-      display: none;
-    }
-    
-    /* ========== SCROLLBAR ========== */
-    ::-webkit-scrollbar {
-      width: 8px;
-      height: 8px;
-    }
-    
-    ::-webkit-scrollbar-track {
-      background: transparent;
-    }
-    
-    ::-webkit-scrollbar-thumb {
-      background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.3));
-      border-radius: 4px;
-    }
-    
-    ::-webkit-scrollbar-thumb:hover {
-      background: var(--vscode-scrollbarSlider-hoverBackground, rgba(128,128,128,0.5));
+      cursor: pointer;
     }
   </style>
 </head>
 <body>
-  <div id="app-container">
-    <!-- Left Rail -->
-    <nav id="left-rail">
-      <section class="rail-section" id="profiles-section">
-        <div class="rail-add-btn" id="add-profile-btn" data-tooltip="Add Profile">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M8 3v10M3 8h10"/>
-          </svg>
-        </div>
-      </section>
-      <div class="rail-separator"></div>
-      <section class="rail-section" id="sessions-section">
-        <div class="rail-add-btn" id="new-session-btn" data-tooltip="New Session">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <rect x="2" y="3" width="12" height="10" rx="1"/>
-            <path d="M5 8l2 2-2 2"/>
-            <path d="M9 10h3"/>
-          </svg>
-        </div>
-      </section>
-    </nav>
-    
-    <!-- Main Panel -->
-    <main id="main-panel">
-      <!-- Top Bar -->
-      <header id="top-bar">
-        <span id="active-label">No active session</span>
-        <div id="top-bar-actions">
-          <button class="topbar-btn" id="btn-new" title="New Session" disabled>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M8 3v10M3 8h10"/>
-            </svg>
-          </button>
-          <button class="topbar-btn" id="btn-restart" title="Restart" disabled>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5"/>
-              <path d="M8 2.5V0.5l2.5 2-2.5 2"/>
-            </svg>
-          </button>
-          <button class="topbar-btn" id="btn-kill" title="Kill" disabled>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M4 4l8 8M12 4l-8 8"/>
-            </svg>
-          </button>
-          <button class="topbar-btn" id="btn-clear" title="Clear" disabled>
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <rect x="2" y="3" width="12" height="10" rx="1"/>
-              <path d="M2 6h12"/>
-            </svg>
-          </button>
-        </div>
-      </header>
-      
-      <!-- Terminal Surface -->
-      <div id="terminal-surface">
-        <div id="empty-state">
-          <img src="${brainLogoUri}" alt="Oracle Dock" class="brain-logo">
-          <p>Oracle Dock</p>
-          <span class="empty-hint">Create a profile to get started</span>
-        </div>
-      </div>
-      
-      <!-- New Session Modal -->
-      <div id="modal-new-session" class="modal-overlay hidden">
-        <div class="modal-content">
-          <h3>New Session</h3>
-          <div id="ascii-preview" class="ascii-preview hidden">
-            <pre id="ascii-art"></pre>
-          </div>
-          <div class="modal-field">
-            <label>Profile</label>
-            <select id="modal-profile-select">
-              <option value="">Select a profile...</option>
-            </select>
-          </div>
-          <div class="modal-field" id="modal-extra-args-field">
-            <label>Extra Arguments (optional)</label>
-            <input type="text" id="modal-extra-args" placeholder="--flag value">
-          </div>
-          <div class="modal-actions">
-            <button class="modal-btn secondary" id="modal-new-cancel">Cancel</button>
-            <button class="modal-btn primary" id="modal-new-run" disabled>Run</button>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Profile Editor Modal -->
-      <div id="modal-profile-editor" class="modal-overlay hidden">
-        <div class="modal-content">
-          <h3 id="modal-profile-title">New Profile</h3>
-          <div class="modal-field">
-            <label>Label</label>
-            <input type="text" id="modal-editor-label" placeholder="e.g., Claude Agent">
-          </div>
-          <div class="modal-field">
-            <label>Command <span id="modal-cli-status" class="cli-status"></span></label>
-            <input type="text" id="modal-editor-command" placeholder="e.g., claude">
-            <div id="modal-install-hint" class="install-hint" style="display:none;"></div>
-          </div>
-          <div class="modal-field">
-            <label>Default Arguments</label>
-            <input type="text" id="modal-editor-args" placeholder="e.g., --dangerously-skip-permissions">
-          </div>
-          <div class="modal-checkbox">
-            <input type="checkbox" id="modal-editor-allow-extra" checked>
-            <span>Allow extra arguments on spawn</span>
-          </div>
-          <div class="modal-actions">
-            <button class="modal-btn danger" id="modal-editor-delete" style="display:none;">Delete</button>
-            <div style="flex:1;"></div>
-            <button class="modal-btn secondary" id="modal-editor-cancel">Cancel</button>
-            <button class="modal-btn primary" id="modal-editor-save">Save</button>
-          </div>
-        </div>
-      </div>
-    </main>
-  </div>
-  
-  <!-- Tooltip element -->
-  <div id="tooltip" class="tooltip hidden"></div>
+  <div id="app">
+    <div id="app-title">Oracle Dock</div>
+    <div id="ui-error" class="hidden" role="alert" aria-live="polite"></div>
+    <div id="fatal-error" class="hidden" role="alert" aria-live="assertive">
+      <div class="error-title">Oracle Dock failed to load</div>
+      <div id="fatal-error-message">An unexpected error occurred.</div>
+      <button id="fatal-error-reload" type="button">Reload</button>
+    </div>
 
-  <!-- Bundled xterm.js -->
+    <section class="section">
+      <div class="section-title">Agent</div>
+      <div class="launcher-row">
+        <select id="agent-select" class="agent-select" aria-label="Agent selector"></select>
+        <button id="agent-launch" class="agent-launch" type="button">Launch</button>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Sessions</div>
+      <div id="session-list" class="list"></div>
+    </section>
+
+    <section class="section" id="terminal-section">
+      <div class="section-title">Active Session</div>
+      <div id="active-session">
+        <span class="logo empty" id="active-session-logo">
+          <img id="active-session-logo-img" alt="">
+        </span>
+        <div id="active-session-label">No active session</div>
+      </div>
+      <div id="terminal-surface"></div>
+    </section>
+  </div>
+
   <script src="${xtermJsUri}"></script>
   <script src="${xtermFitUri}"></script>
 
   <script nonce="${nonce}">
     (function() {
-      // VS Code API for postMessage communication
+      const appContainer = document.getElementById('app');
+      const fatalOverlay = document.getElementById('fatal-error');
+      const fatalMessage = document.getElementById('fatal-error-message');
+      const fatalReload = document.getElementById('fatal-error-reload');
+      const uiError = document.getElementById('ui-error');
+
+      function showFatalError(message) {
+        console.error('[OracleDock Webview] Fatal error:', message);
+        if (fatalMessage) fatalMessage.textContent = message;
+        if (fatalOverlay) fatalOverlay.classList.remove('hidden');
+        if (appContainer) appContainer.setAttribute('aria-hidden', 'true');
+      }
+
+      window.addEventListener('error', (event) => {
+        showFatalError(event.message || 'Script error');
+      });
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event && event.reason ? String(event.reason) : 'Unhandled promise rejection';
+        showFatalError(reason);
+      });
+
+      if (fatalReload) {
+        fatalReload.addEventListener('click', () => {
+          location.reload();
+        });
+      }
+
+      if (typeof acquireVsCodeApi !== 'function') {
+        showFatalError('VS Code API unavailable. Reload the window.');
+        return;
+      }
+
+      if (typeof Terminal !== 'function' || !window.FitAddon || typeof window.FitAddon.FitAddon !== 'function') {
+        showFatalError('xterm.js failed to load. Check the extension media assets.');
+        return;
+      }
+
       const vscode = acquireVsCodeApi();
 
-      // ========== SECURITY LIMITS (Client-side) ==========
-      // These limits mirror server-side limits for defense in depth
-      
-      /** Maximum lines to keep in client output buffer */
       const MAX_CLIENT_BUFFER_LINES = 5000;
-      
-      /** Valid message types from extension - ignore unknown types */
       const VALID_EXTENSION_MESSAGES = new Set([
         'sessionStarted', 'sessionOutput', 'sessionExited', 'sessionKilled',
-        'error', 'ready', 'commandStatus', 'restoreState'
+        'error', 'ready', 'restoreState'
       ]);
 
-      // ========== DOM Elements ==========
-      
-      // Left Rail
-      const leftRail = document.getElementById('left-rail');
-      const profilesSection = document.getElementById('profiles-section');
-      const sessionsSection = document.getElementById('sessions-section');
-      const addProfileBtn = document.getElementById('add-profile-btn');
-      const newSessionBtn = document.getElementById('new-session-btn');
-      
-      // Top Bar
-      const activeLabel = document.getElementById('active-label');
-      const btnNew = document.getElementById('btn-new');
-      const btnRestart = document.getElementById('btn-restart');
-      const btnKill = document.getElementById('btn-kill');
-      const btnClear = document.getElementById('btn-clear');
-      
-      // Terminal Surface
+      const agentSelect = document.getElementById('agent-select');
+      const agentLaunch = document.getElementById('agent-launch');
+      const sessionList = document.getElementById('session-list');
       const terminalSurface = document.getElementById('terminal-surface');
-      const emptyState = document.getElementById('empty-state');
-      
-      // Tooltip
-      const tooltip = document.getElementById('tooltip');
-      
-      // New Session Modal
-      const modalNewSession = document.getElementById('modal-new-session');
-      const modalProfileSelect = document.getElementById('modal-profile-select');
-      const modalExtraArgs = document.getElementById('modal-extra-args');
-      const modalExtraArgsField = document.getElementById('modal-extra-args-field');
-      const modalNewCancel = document.getElementById('modal-new-cancel');
-      const modalNewRun = document.getElementById('modal-new-run');
-      const asciiPreview = document.getElementById('ascii-preview');
-      const asciiArt = document.getElementById('ascii-art');
-      
-      // Profile Editor Modal
-      const modalProfileEditor = document.getElementById('modal-profile-editor');
-      const modalProfileTitle = document.getElementById('modal-profile-title');
-      const modalEditorLabel = document.getElementById('modal-editor-label');
-      const modalEditorCommand = document.getElementById('modal-editor-command');
-      const modalEditorArgs = document.getElementById('modal-editor-args');
-      const modalEditorAllowExtra = document.getElementById('modal-editor-allow-extra');
-      const modalCliStatus = document.getElementById('modal-cli-status');
-      const modalInstallHint = document.getElementById('modal-install-hint');
-      const modalEditorDelete = document.getElementById('modal-editor-delete');
-      const modalEditorCancel = document.getElementById('modal-editor-cancel');
-      const modalEditorSave = document.getElementById('modal-editor-save');
+      const activeSessionLogo = document.getElementById('active-session-logo');
+      const activeSessionLogoImg = document.getElementById('active-session-logo-img');
+      const activeSessionLabel = document.getElementById('active-session-label');
 
-      // ========== CLI Discovery ==========
+      const AGENT_CLIS = [
+        'claude',
+        'codex',
+        'gemini',
+        'droid',
+        'kiro-cli',
+        'kilocode',
+        'opencode',
+        'aider'
+      ];
 
-      const INSTALL_REGISTRY = {
-        'claude': 'npm install -g @anthropic-ai/claude-code',
-        'codex': 'npm install -g @openai/codex',
-        'aider': 'pip install aider-chat',
-        'gh': 'brew install gh',
-        'node': 'brew install node',
-        'python': 'brew install python',
-        'python3': 'brew install python',
-        'npm': 'brew install node',
-        'npx': 'brew install node',
-        'pip': 'brew install python',
-        'pip3': 'brew install python',
-        'git': 'brew install git',
-        'docker': 'brew install --cask docker',
-        'kubectl': 'brew install kubectl',
-        'aws': 'brew install awscli',
-        'gcloud': 'brew install --cask google-cloud-sdk',
-        'terraform': 'brew install terraform',
-        'cargo': 'brew install rust',
-        'rustc': 'brew install rust',
-        'go': 'brew install go',
-        'java': 'brew install openjdk',
-        'mvn': 'brew install maven',
-        'gradle': 'brew install gradle'
-      };
-
-      const cliStatusCache = new Map();
-      const pendingChecks = new Set();
-
-      // ========== ASCII Art Registry ==========
-      
-      // ANSI color codes for terminal rendering
-      const ANSI = {
-        RESET: '\x1b[0m',
-        BLUE: '\x1b[38;5;33m',        // gemini
-        WHITE: '\x1b[38;5;255m',      // codex
-        ORANGE: '\x1b[38;5;208m',     // claude
-        PURPLE: '\x1b[38;5;141m',     // kiro
-        YELLOW: '\x1b[38;5;226m',     // droid
-        NEON_GREEN: '\x1b[38;5;46m'   // kilo
-      };
-
-      const ASCII_REGISTRY = {
-        'claude': {
-          color: ANSI.ORANGE,
-          art: [
-            '   ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗',
-            '  ██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝',
-            '  ██║     ██║     ███████║██║   ██║██║  ██║█████╗  ',
-            '  ██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ',
-            '  ╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗',
-            '   ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝'
-          ]
-        },
-        'gemini': {
-          color: ANSI.BLUE,
-          art: [
-            '   ██████╗ ███████╗███╗   ███╗██╗███╗   ██╗██╗',
-            '  ██╔════╝ ██╔════╝████╗ ████║██║████╗  ██║██║',
-            '  ██║  ███╗█████╗  ██╔████╔██║██║██╔██╗ ██║██║',
-            '  ██║   ██║██╔══╝  ██║╚██╔╝██║██║██║╚██╗██║██║',
-            '  ╚██████╔╝███████╗██║ ╚═╝ ██║██║██║ ╚████║██║',
-            '   ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝'
-          ]
-        },
-        'codex': {
-          color: ANSI.WHITE,
-          art: [
-            '   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗',
-            '  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝',
-            '  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝ ',
-            '  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗ ',
-            '  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗',
-            '   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝'
-          ]
-        },
-        'kiro': {
-          color: ANSI.PURPLE,
-          art: [
-            '  ██╗  ██╗██╗██████╗  ██████╗ ',
-            '  ██║ ██╔╝██║██╔══██╗██╔═══██╗',
-            '  █████╔╝ ██║██████╔╝██║   ██║',
-            '  ██╔═██╗ ██║██╔══██╗██║   ██║',
-            '  ██║  ██╗██║██║  ██║╚██████╔╝',
-            '  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ '
-          ]
-        },
-        'kiro-cli': {
-          color: ANSI.PURPLE,
-          art: [
-            '  ██╗  ██╗██╗██████╗  ██████╗ ',
-            '  ██║ ██╔╝██║██╔══██╗██╔═══██╗',
-            '  █████╔╝ ██║██████╔╝██║   ██║',
-            '  ██╔═██╗ ██║██╔══██╗██║   ██║',
-            '  ██║  ██╗██║██║  ██║╚██████╔╝',
-            '  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ '
-          ]
-        },
-        'droid': {
-          color: ANSI.YELLOW,
-          art: [
-            '  ██████╗ ██████╗  ██████╗ ██╗██████╗ ',
-            '  ██╔══██╗██╔══██╗██╔═══██╗██║██╔══██╗',
-            '  ██║  ██║██████╔╝██║   ██║██║██║  ██║',
-            '  ██║  ██║██╔══██╗██║   ██║██║██║  ██║',
-            '  ██████╔╝██║  ██║╚██████╔╝██║██████╔╝',
-            '  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝ '
-          ]
-        },
-        'kilo': {
-          color: ANSI.NEON_GREEN,
-          art: [
-            '  ██╗  ██╗██╗██╗      ██████╗ ',
-            '  ██║ ██╔╝██║██║     ██╔═══██╗',
-            '  █████╔╝ ██║██║     ██║   ██║',
-            '  ██╔═██╗ ██║██║     ██║   ██║',
-            '  ██║  ██╗██║███████╗╚██████╔╝',
-            '  ╚═╝  ╚═╝╚═╝╚══════╝ ╚═════╝ '
-          ]
-        },
-        'kilo-code': {
-          color: ANSI.NEON_GREEN,
-          art: [
-            '  ██╗  ██╗██╗██╗      ██████╗ ',
-            '  ██║ ██╔╝██║██║     ██╔═══██╗',
-            '  █████╔╝ ██║██║     ██║   ██║',
-            '  ██╔═██╗ ██║██║     ██║   ██║',
-            '  ██║  ██╗██║███████╗╚██████╔╝',
-            '  ╚═╝  ╚═╝╚═╝╚══════╝ ╚═════╝ '
-          ]
-        },
-        'aider': {
-          color: ANSI.NEON_GREEN,
-          art: [
-            '   █████╗ ██╗██████╗ ███████╗██████╗ ',
-            '  ██╔══██╗██║██╔══██╗██╔════╝██╔══██╗',
-            '  ███████║██║██║  ██║█████╗  ██████╔╝',
-            '  ██╔══██║██║██║  ██║██╔══╝  ██╔══██╗',
-            '  ██║  ██║██║██████╔╝███████╗██║  ██║',
-            '  ╚═╝  ╚═╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝'
-          ]
-        }
-      };
-
-      /**
-       * Render ASCII art for a command into the preview element.
-       * Uses ANSI escape sequences for coloring.
-       */
-      function renderAsciiArt(command) {
-        const entry = ASCII_REGISTRY[command];
-        
-        if (!entry) {
-          // No ASCII art available - hide preview
-          asciiPreview.classList.add('hidden');
-          asciiArt.textContent = '';
-          return;
-        }
-        
-        // Build colored ASCII art with ANSI codes
-        const coloredArt = entry.color + entry.art.join('\n') + ANSI.RESET;
-        
-        // Convert ANSI codes to HTML spans for display
-        const html = ansiToHtml(coloredArt);
-        asciiArt.innerHTML = html;
-        asciiPreview.classList.remove('hidden');
-      }
-
-      /**
-       * Convert ANSI escape sequences to HTML spans.
-       * Handles 256-color codes (38;5;N format).
-       */
-      function ansiToHtml(text) {
-        // Color mapping for 256-color codes
-        const colors = {
-          33: '#0087ff',   // blue (gemini)
-          255: '#eeeeee',  // white (codex)
-          208: '#ff8700',  // orange (claude)
-          141: '#af87ff',  // purple (kiro)
-          226: '#ffff00',  // yellow (droid)
-          46: '#00ff00'    // neon green (kilo)
-        };
-        
-        let html = '';
-        let currentColor = null;
-        let i = 0;
-        
-        while (i < text.length) {
-          if (text[i] === '\x1b' && text[i + 1] === '[') {
-            // Parse ANSI escape sequence
-            let j = i + 2;
-            while (j < text.length && text[j] !== 'm') {
-              j++;
-            }
-            const code = text.substring(i + 2, j);
-            
-            if (code === '0') {
-              // Reset
-              if (currentColor) {
-                html += '</span>';
-                currentColor = null;
-              }
-            } else if (code.startsWith('38;5;')) {
-              // 256-color foreground
-              const colorNum = parseInt(code.substring(5), 10);
-              if (currentColor) {
-                html += '</span>';
-              }
-              const hexColor = colors[colorNum] || '#888888';
-              html += '<span style="color:' + hexColor + '">';
-              currentColor = hexColor;
-            }
-            
-            i = j + 1;
-          } else {
-            // Escape HTML special characters
-            const char = text[i];
-            if (char === '<') {
-              html += '&lt;';
-            } else if (char === '>') {
-              html += '&gt;';
-            } else if (char === '&') {
-              html += '&amp;';
-            } else {
-              html += char;
-            }
-            i++;
-          }
-        }
-        
-        if (currentColor) {
-          html += '</span>';
-        }
-        
-        return html;
-      }
-
-      function checkCommand(command) {
-        if (!command || pendingChecks.has(command)) return;
-        pendingChecks.add(command);
-        vscode.postMessage({ type: 'checkCommand', command });
-      }
-
-      function getInstallHint(command) {
-        return INSTALL_REGISTRY[command] || null;
-      }
-
-      function updateModalCliStatus(command) {
-        if (!command) {
-          modalCliStatus.textContent = '';
-          modalCliStatus.className = 'cli-status';
-          modalInstallHint.style.display = 'none';
-          return;
-        }
-
-        const cached = cliStatusCache.get(command);
-        
-        if (cached) {
-          if (cached.installed) {
-            modalCliStatus.textContent = 'installed';
-            modalCliStatus.className = 'cli-status installed';
-            modalInstallHint.style.display = 'none';
-          } else {
-            modalCliStatus.textContent = 'missing';
-            modalCliStatus.className = 'cli-status missing';
-            const hint = getInstallHint(command);
-            if (hint) {
-              modalInstallHint.innerHTML = 'Install: <code>' + hint + '</code>';
-              modalInstallHint.style.display = 'block';
-            } else {
-              modalInstallHint.style.display = 'none';
-            }
-          }
-        } else {
-          modalCliStatus.textContent = '...';
-          modalCliStatus.className = 'cli-status checking';
-          modalInstallHint.style.display = 'none';
-          checkCommand(command);
-        }
-      }
-
-      // ========== State Management ==========
-
-      const profiles = new Map();
-      let profileCounter = 0;
-      let editingProfileId = null;
+      const AGENT_LOGOS = ${JSON.stringify(logoUris)};
 
       const sessions = new Map();
       let activeSessionId = null;
-      let stateRestored = false;
-
-      // ========== Persistence ==========
-
-      function persistProfiles() {
-        const profilesArray = Array.from(profiles.values()).map(p => ({
-          agentId: p.agentId,
-          label: p.label,
-          command: p.command,
-          defaultArgs: p.defaultArgs,
-          allowExtraArgs: p.allowExtraArgs
-        }));
-        vscode.postMessage({ type: 'persistProfiles', profiles: profilesArray });
-      }
+      const pendingKills = new Set();
+      const missingAgents = new Set();
 
       function persistSessions() {
         const sessionsArray = Array.from(sessions.values()).map(s => ({
@@ -1887,264 +1237,189 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'requestPersistedState' });
       }
 
-      // ========== Tooltip ==========
-
-      function showTooltip(text, x, y) {
-        tooltip.textContent = text;
-        tooltip.style.left = (x + 8) + 'px';
-        tooltip.style.top = y + 'px';
-        tooltip.classList.remove('hidden');
+      function showUiError(message) {
+        if (!uiError) return;
+        uiError.textContent = message;
+        uiError.classList.remove('hidden');
       }
 
-      function hideTooltip() {
-        tooltip.classList.add('hidden');
+      function clearUiError() {
+        if (!uiError) return;
+        uiError.textContent = '';
+        uiError.classList.add('hidden');
       }
 
-      // Setup tooltip for elements with data-tooltip
-      document.addEventListener('mouseover', (e) => {
-        const target = e.target.closest('[data-tooltip]');
-        if (target) {
-          const rect = target.getBoundingClientRect();
-          showTooltip(target.dataset.tooltip, rect.right, rect.top);
+      function formatAgentLabel(command) {
+        return command.split('-').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+      }
+
+      function buildLogo(command, label) {
+        const wrapper = document.createElement('span');
+        wrapper.className = 'logo';
+
+        const img = document.createElement('img');
+        const src = AGENT_LOGOS[command];
+        if (src) {
+          img.src = src;
+          img.alt = label + ' logo';
+        } else {
+          wrapper.classList.add('empty');
+          img.alt = '';
         }
-      });
-
-      document.addEventListener('mouseout', (e) => {
-        const target = e.target.closest('[data-tooltip]');
-        if (target) {
-          hideTooltip();
-        }
-      });
-
-      // ========== Profile Management ==========
-
-      function generateProfileId() {
-        return 'profile-' + (++profileCounter) + '-' + Date.now();
+        wrapper.appendChild(img);
+        return wrapper;
       }
 
-      function showProfileEditorModal(profile = null) {
-        editingProfileId = profile ? profile.agentId : null;
-        
-        modalProfileTitle.textContent = profile ? 'Edit Profile' : 'New Profile';
-        modalEditorLabel.value = profile ? profile.label : '';
-        modalEditorCommand.value = profile ? profile.command : '';
-        modalEditorArgs.value = profile ? profile.defaultArgs.join(' ') : '';
-        modalEditorAllowExtra.checked = profile ? profile.allowExtraArgs : true;
-        
-        modalEditorDelete.style.display = profile ? 'block' : 'none';
-        
-        updateModalCliStatus(profile ? profile.command : '');
-        
-        modalProfileEditor.classList.remove('hidden');
-        modalEditorLabel.focus();
-      }
-
-      function hideProfileEditorModal() {
-        // SECURITY: Clear pending debounce timer to prevent stale callbacks
-        if (typeof commandCheckTimeout !== 'undefined') {
-          clearTimeout(commandCheckTimeout);
-        }
-        modalProfileEditor.classList.add('hidden');
-        editingProfileId = null;
-        modalCliStatus.textContent = '';
-        modalCliStatus.className = 'cli-status';
-        modalInstallHint.style.display = 'none';
-      }
-
-      function saveProfile() {
-        const label = modalEditorLabel.value.trim();
-        const command = modalEditorCommand.value.trim();
-        const argsStr = modalEditorArgs.value.trim();
-        const allowExtraArgs = modalEditorAllowExtra.checked;
-        
-        if (!label || !command) {
-          return;
-        }
-        
-        const defaultArgs = argsStr ? argsStr.split(/\\s+/) : [];
-        const agentId = editingProfileId || generateProfileId();
-        
-        const profile = {
-          agentId,
-          label,
-          command,
-          defaultArgs,
-          allowExtraArgs
-        };
-        
-        profiles.set(agentId, profile);
-        hideProfileEditorModal();
-        renderRail();
-        updateModalProfileSelect();
-        persistProfiles();
-      }
-
-      function deleteProfile(agentId) {
-        profiles.delete(agentId);
-        hideProfileEditorModal();
-        renderRail();
-        updateModalProfileSelect();
-        persistProfiles();
-      }
-
-      // ========== New Session Modal ==========
-
-      function showNewSessionModal() {
-        updateModalProfileSelect();
-        modalExtraArgs.value = '';
-        modalNewRun.disabled = true;
-        // Reset ASCII preview
-        asciiPreview.classList.add('hidden');
-        asciiArt.textContent = '';
-        modalNewSession.classList.remove('hidden');
-        modalProfileSelect.focus();
-      }
-
-      function hideNewSessionModal() {
-        modalNewSession.classList.add('hidden');
-      }
-
-      function updateModalProfileSelect() {
-        modalProfileSelect.innerHTML = '<option value="">Select a profile...</option>';
-        
-        for (const [agentId, profile] of profiles) {
+      function populateAgentSelect() {
+        const selected = agentSelect.value;
+        agentSelect.innerHTML = '';
+        for (const command of AGENT_CLIS) {
           const option = document.createElement('option');
-          option.value = agentId;
-          option.textContent = profile.label;
-          modalProfileSelect.appendChild(option);
+          option.value = command;
+          const label = formatAgentLabel(command);
+          option.textContent = missingAgents.has(command)
+            ? label + ' (not installed)'
+            : label;
+          agentSelect.appendChild(option);
+        }
+        if (selected && AGENT_CLIS.includes(selected)) {
+          agentSelect.value = selected;
         }
       }
 
-      function spawnFromModal() {
-        const agentId = modalProfileSelect.value;
-        if (!agentId || !profiles.has(agentId)) return;
-        
-        const profile = profiles.get(agentId);
-        const extraArgsStr = modalExtraArgs.value.trim();
-        const extraArgs = extraArgsStr ? extraArgsStr.split(/\\s+/) : [];
-        const finalArgs = [...profile.defaultArgs, ...extraArgs];
-        
+      function spawnCommand(command) {
+        if (!command) return;
+        clearUiError();
         vscode.postMessage({
-          type: 'spawnSessionWithArgs',
-          command: profile.command,
-          args: finalArgs
+          type: 'spawnSession',
+          command: command
         });
-        
-        hideNewSessionModal();
       }
 
-      // ========== Left Rail Rendering ==========
+      function renderSessionList() {
+        sessionList.innerHTML = '';
 
-      function renderRail() {
-        // Clear profile items (keep add button)
-        const profileItems = profilesSection.querySelectorAll('.rail-item');
-        profileItems.forEach(item => item.remove());
-        
-        // Add profile items before the add button
-        for (const [agentId, profile] of profiles) {
-          const item = document.createElement('div');
-          item.className = 'rail-item';
-          item.dataset.profileId = agentId;
-          item.dataset.tooltip = profile.label;
-          
-          // Profile icon (person silhouette)
-          item.innerHTML = \`
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <circle cx="8" cy="5" r="2.5"/>
-              <path d="M3 14c0-2.5 2-4.5 5-4.5s5 2 5 4.5"/>
-            </svg>
-            <span class="accent-bar"></span>
-          \`;
-          
-          // State indicator for CLI status
-          const cached = cliStatusCache.get(profile.command);
-          const indicator = document.createElement('span');
-          indicator.className = 'state-indicator';
-          if (cached) {
-            indicator.classList.add(cached.installed ? 'installed' : 'missing');
-          }
-          item.appendChild(indicator);
-          
-          // Check CLI if not cached
-          if (!cached) {
-            checkCommand(profile.command);
-          }
-          
-          // Click to edit
-          item.addEventListener('click', () => {
-            showProfileEditorModal(profile);
-          });
-          
-          profilesSection.insertBefore(item, addProfileBtn);
-        }
-        
-        // Clear session items (keep add button)
-        const sessionItems = sessionsSection.querySelectorAll('.rail-item');
-        sessionItems.forEach(item => item.remove());
-        
-        // Add session items before the add button
-        for (const [sessionId, session] of sessions) {
-          const item = document.createElement('div');
-          item.className = 'rail-item';
-          if (sessionId === activeSessionId) item.classList.add('active');
-          item.dataset.sessionId = sessionId;
-          
-          const fullCmd = session.args && session.args.length > 0
-            ? session.command + ' ' + session.args.join(' ')
-            : session.command;
-          item.dataset.tooltip = fullCmd;
-          
-          // Terminal icon
-          item.innerHTML = \`
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <rect x="2" y="3" width="12" height="10" rx="1"/>
-              <path d="M5 7l2 1.5-2 1.5"/>
-              <path d="M9 10h3"/>
-            </svg>
-            <span class="accent-bar"></span>
-          \`;
-          
-          // State indicator
-          const indicator = document.createElement('span');
-          indicator.className = 'state-indicator ' + session.state;
-          item.appendChild(indicator);
-          
-          // Click to switch
-          item.addEventListener('click', () => {
-            switchToSession(sessionId);
-          });
-          
-          sessionsSection.insertBefore(item, newSessionBtn);
-        }
-      }
-
-      // ========== Top Bar ==========
-
-      function updateTopBar() {
-        if (!activeSessionId || !sessions.has(activeSessionId)) {
-          activeLabel.innerHTML = 'No active session';
-          btnNew.disabled = profiles.size === 0;
-          btnRestart.disabled = true;
-          btnKill.disabled = true;
-          btnClear.disabled = true;
+        if (sessions.size === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'list-item empty-state';
+          empty.textContent = 'No sessions yet';
+          sessionList.appendChild(empty);
           return;
         }
-        
-        const session = sessions.get(activeSessionId);
-        const fullCmd = session.args && session.args.length > 0
-          ? session.command + ' ' + session.args.join(' ')
-          : session.command;
-        
-        const stateBadge = '<span class="state-badge ' + session.state + '">' + session.state + '</span>';
-        activeLabel.innerHTML = stateBadge + fullCmd;
-        
-        btnNew.disabled = profiles.size === 0;
-        btnRestart.disabled = session.state !== 'exited';
-        btnKill.disabled = session.state !== 'running';
-        btnClear.disabled = !session.terminal;
+
+        const counts = new Map();
+        for (const [sessionId, session] of sessions) {
+          const count = (counts.get(session.command) || 0) + 1;
+          counts.set(session.command, count);
+
+          const labelText = formatAgentLabel(session.command) + ' #' + count;
+          const item = document.createElement('div');
+          item.className = 'list-item';
+          item.setAttribute('role', 'button');
+          item.setAttribute('tabindex', '0');
+          if (sessionId === activeSessionId) {
+            item.classList.add('active');
+          }
+
+          item.appendChild(buildLogo(session.command, formatAgentLabel(session.command)));
+
+          const label = document.createElement('span');
+          label.className = 'label';
+          label.textContent = labelText;
+          item.appendChild(label);
+
+          const state = document.createElement('span');
+          state.className = 'state';
+          state.textContent = session.state;
+          item.appendChild(state);
+
+          const killButton = document.createElement('button');
+          killButton.type = 'button';
+          killButton.className = 'kill-btn';
+          killButton.setAttribute('aria-label', 'Kill session');
+          killButton.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
+          killButton.addEventListener('click', (event) => {
+            event.stopPropagation();
+            pendingKills.add(sessionId);
+            renderSessionList();
+          });
+          item.appendChild(killButton);
+
+          if (pendingKills.has(sessionId)) {
+            const confirmBtn = document.createElement('button');
+            confirmBtn.type = 'button';
+            confirmBtn.className = 'confirm-btn danger';
+            confirmBtn.textContent = 'Confirm';
+            confirmBtn.addEventListener('click', (event) => {
+              event.stopPropagation();
+              pendingKills.delete(sessionId);
+              killSession(sessionId);
+            });
+            item.appendChild(confirmBtn);
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.type = 'button';
+            cancelBtn.className = 'confirm-btn';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.addEventListener('click', (event) => {
+              event.stopPropagation();
+              pendingKills.delete(sessionId);
+              renderSessionList();
+            });
+            item.appendChild(cancelBtn);
+          }
+
+          item.addEventListener('click', () => {
+            switchToSession(sessionId, true);
+          });
+          item.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              switchToSession(sessionId, true);
+            }
+          });
+
+          sessionList.appendChild(item);
+        }
       }
 
-      // ========== Terminal Management ==========
+      function updateActiveSessionHeader() {
+        if (!activeSessionId || !sessions.has(activeSessionId)) {
+          activeSessionLabel.textContent = 'No active session';
+          activeSessionLogo.classList.add('empty');
+          activeSessionLogoImg.removeAttribute('src');
+          activeSessionLogoImg.alt = '';
+          return;
+        }
+
+        const session = sessions.get(activeSessionId);
+        const label = getSessionDisplayName(activeSessionId);
+        activeSessionLabel.textContent = label;
+
+        const logoSrc = AGENT_LOGOS[session.command];
+        if (logoSrc) {
+          activeSessionLogo.classList.remove('empty');
+          activeSessionLogoImg.src = logoSrc;
+          activeSessionLogoImg.alt = formatAgentLabel(session.command) + ' logo';
+        } else {
+          activeSessionLogo.classList.add('empty');
+          activeSessionLogoImg.removeAttribute('src');
+          activeSessionLogoImg.alt = '';
+        }
+      }
+
+      function getSessionDisplayName(sessionId) {
+        const counts = new Map();
+        for (const [id, session] of sessions) {
+          const count = (counts.get(session.command) || 0) + 1;
+          counts.set(session.command, count);
+          if (id === sessionId) {
+            return formatAgentLabel(session.command) + ' #' + count;
+          }
+        }
+        const session = sessions.get(sessionId);
+        return session ? formatAgentLabel(session.command) : 'Unknown Session';
+      }
 
       function createTerminalForSession(sessionId) {
         const terminal = new Terminal({
@@ -2169,12 +1444,12 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         terminalSurface.appendChild(wrapper);
 
         terminal.open(wrapper);
-        
+
         terminal.onData(data => {
-          vscode.postMessage({ 
-            type: 'writeInput', 
+          vscode.postMessage({
+            type: 'writeInput',
             sessionId: sessionId,
-            data: data 
+            data: data
           });
         });
 
@@ -2203,7 +1478,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         terminalSurface.appendChild(wrapper);
 
         terminal.open(wrapper);
-        
+
         if (outputSnapshot && outputSnapshot.length > 0) {
           terminal.write(outputSnapshot.join('\\n'));
           terminal.write('\\r\\n\\x1b[90m[Session restored - output is read-only]\\x1b[0m\\r\\n');
@@ -2214,10 +1489,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         return { terminal, fitAddon, wrapper };
       }
 
-      function switchToSession(sessionId) {
-        if (activeSessionId === sessionId) return;
-        
-        // Hide current terminal (detach pattern - just hide, don't destroy)
+      function switchToSession(sessionId, force) {
+        if (!force && activeSessionId === sessionId) return;
+
         if (activeSessionId && sessions.has(activeSessionId)) {
           const current = sessions.get(activeSessionId);
           if (current.wrapper) {
@@ -2229,8 +1503,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         if (session) {
           session.wrapper.classList.remove('hidden');
           activeSessionId = sessionId;
-          
-          // Batch DOM updates with requestAnimationFrame
+
           requestAnimationFrame(() => {
             session.fitAddon.fit();
             sendResize(sessionId, session.terminal);
@@ -2238,10 +1511,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
           });
         }
 
-        renderRail();
-        updateTopBar();
-        emptyState.classList.add('hidden');
-        
+        renderSessionList();
+        updateActiveSessionHeader();
+
         vscode.postMessage({ type: 'focusSession', sessionId });
         persistActiveSession();
       }
@@ -2255,19 +1527,6 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         });
       }
 
-      function restartSession(sessionId) {
-        const session = sessions.get(sessionId);
-        if (!session || session.state !== 'exited') return;
-        
-        removeSession(sessionId);
-        
-        vscode.postMessage({
-          type: 'spawnSessionWithArgs',
-          command: session.command,
-          args: session.args || []
-        });
-      }
-
       function killSession(sessionId) {
         vscode.postMessage({ type: 'killSession', sessionId });
       }
@@ -2275,41 +1534,30 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       function removeSession(sessionId) {
         const session = sessions.get(sessionId);
         if (!session) return;
-        
+
         if (session.terminal) {
           session.terminal.dispose();
         }
         if (session.wrapper) {
           session.wrapper.remove();
         }
-        
+
         sessions.delete(sessionId);
-        
+        pendingKills.delete(sessionId);
+
         if (activeSessionId === sessionId) {
           activeSessionId = null;
           const remaining = Array.from(sessions.keys());
           if (remaining.length > 0) {
-            switchToSession(remaining[0]);
-          } else {
-            emptyState.classList.remove('hidden');
-            updateTopBar();
+            switchToSession(remaining[0], true);
           }
         }
-        
-        renderRail();
+
+        renderSessionList();
+        updateActiveSessionHeader();
         persistSessions();
       }
 
-      function clearTerminal() {
-        if (activeSessionId && sessions.has(activeSessionId)) {
-          const session = sessions.get(activeSessionId);
-          if (session.terminal) {
-            session.terminal.clear();
-          }
-        }
-      }
-
-      // Handle resize
       const resizeObserver = new ResizeObserver(() => {
         if (activeSessionId && sessions.has(activeSessionId)) {
           const session = sessions.get(activeSessionId);
@@ -2321,129 +1569,32 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       });
       resizeObserver.observe(terminalSurface);
 
-      // ========== Event Listeners ==========
-
-      // Add profile button
-      addProfileBtn.addEventListener('click', () => showProfileEditorModal(null));
-      
-      // New session button in rail
-      newSessionBtn.addEventListener('click', () => {
-        if (profiles.size > 0) {
-          showNewSessionModal();
-        } else {
-          showProfileEditorModal(null);
-        }
-      });
-      
-      // Top bar buttons
-      btnNew.addEventListener('click', () => showNewSessionModal());
-      btnRestart.addEventListener('click', () => {
-        if (activeSessionId) restartSession(activeSessionId);
-      });
-      btnKill.addEventListener('click', () => {
-        if (activeSessionId) killSession(activeSessionId);
-      });
-      btnClear.addEventListener('click', clearTerminal);
-      
-      // Profile editor modal
-      modalEditorSave.addEventListener('click', saveProfile);
-      modalEditorCancel.addEventListener('click', hideProfileEditorModal);
-      modalEditorDelete.addEventListener('click', () => {
-        if (editingProfileId) deleteProfile(editingProfileId);
-      });
-      
-      // CLI check on command input (debounced)
-      let commandCheckTimeout = null;
-      modalEditorCommand.addEventListener('input', () => {
-        clearTimeout(commandCheckTimeout);
-        commandCheckTimeout = setTimeout(() => {
-          updateModalCliStatus(modalEditorCommand.value.trim());
-        }, 300);
-      });
-      
-      // New session modal
-      modalNewCancel.addEventListener('click', hideNewSessionModal);
-      modalNewRun.addEventListener('click', spawnFromModal);
-      modalProfileSelect.addEventListener('change', () => {
-        const agentId = modalProfileSelect.value;
-        modalNewRun.disabled = !agentId;
-        
-        if (agentId && profiles.has(agentId)) {
-          const profile = profiles.get(agentId);
-          modalExtraArgsField.style.display = profile.allowExtraArgs ? 'block' : 'none';
-          
-          // Render ASCII art for the selected CLI
-          renderAsciiArt(profile.command);
-        } else {
-          // Hide ASCII art when no profile selected
-          asciiPreview.classList.add('hidden');
-          asciiArt.textContent = '';
-        }
-      });
-      
-      // Enter key in extra args
-      modalExtraArgs.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          spawnFromModal();
-        }
-      });
-      
-      // Close modals on backdrop click
-      modalNewSession.addEventListener('click', (e) => {
-        if (e.target === modalNewSession) hideNewSessionModal();
-      });
-      modalProfileEditor.addEventListener('click', (e) => {
-        if (e.target === modalProfileEditor) hideProfileEditorModal();
-      });
-      
-      // Escape key to close modals
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-          if (!modalNewSession.classList.contains('hidden')) {
-            hideNewSessionModal();
-          }
-          if (!modalProfileEditor.classList.contains('hidden')) {
-            hideProfileEditorModal();
-          }
-        }
-      });
-
-      // ========== Message Handling ==========
-
       window.addEventListener('message', (event) => {
         const message = event.data;
 
-        // SECURITY: Validate message object
         if (!message || typeof message !== 'object') {
           console.warn('[OracleDock Webview] Ignored invalid message');
           return;
         }
 
-        // SECURITY: Reject unknown message types
         if (typeof message.type !== 'string' || !VALID_EXTENSION_MESSAGES.has(message.type)) {
-          // Silently ignore unknown types - may be from other extensions
           return;
         }
 
         switch (message.type) {
           case 'sessionStarted': {
             const { sessionId, command, args } = message;
-            
-            // SECURITY: Validate required fields
             if (typeof sessionId !== 'string' || typeof command !== 'string') {
               console.warn('[OracleDock Webview] Invalid sessionStarted message');
               break;
             }
 
-            // SECURITY: Guard against duplicate session IDs
             if (sessions.has(sessionId)) {
               console.warn('[OracleDock Webview] Duplicate session ignored:', sessionId);
               break;
             }
-            
+
             const { terminal, fitAddon, wrapper } = createTerminalForSession(sessionId);
-            
             sessions.set(sessionId, {
               sessionId,
               command,
@@ -2454,27 +1605,27 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
               state: 'running',
               outputBuffer: []
             });
-            
-            switchToSession(sessionId);
+
+            missingAgents.delete(command);
+            populateAgentSelect();
+            clearUiError();
+
+            switchToSession(sessionId, true);
             persistSessions();
             break;
           }
 
           case 'sessionOutput': {
             const { sessionId, data } = message;
-            
-            // SECURITY: Validate fields
             if (typeof sessionId !== 'string' || typeof data !== 'string') break;
-            
+
             const session = sessions.get(sessionId);
             if (session && data) {
-              // SECURITY: Enforce client-side buffer limit
               if (session.outputBuffer.length >= MAX_CLIENT_BUFFER_LINES) {
-                // Remove oldest 10% of entries
                 const toRemove = Math.ceil(MAX_CLIENT_BUFFER_LINES * 0.1);
                 session.outputBuffer.splice(0, toRemove);
               }
-              
+
               session.outputBuffer.push(data);
               session.terminal.write(data);
             }
@@ -2488,8 +1639,8 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
               session.state = 'exited';
               session.exitCode = code;
               session.terminal.write('\\r\\n\\x1b[90m[Process exited with code ' + code + ']\\x1b[0m\\r\\n');
-              renderRail();
-              updateTopBar();
+              renderSessionList();
+              updateActiveSessionHeader();
               persistSessions();
             }
             break;
@@ -2502,7 +1653,17 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
           }
 
           case 'error': {
-            console.error('Oracle Dock Error:', message.message);
+            const text = message.message || 'Unexpected error';
+            console.error('Oracle Dock Error:', text);
+            const match = text.match(/Agent CLI not found in PATH:\\s*([^\\s]+)/i);
+            if (match) {
+              const command = match[1];
+              missingAgents.add(command);
+              populateAgentSelect();
+              showUiError('Not installed: ' + formatAgentLabel(command));
+            } else {
+              showUiError(text);
+            }
             break;
           }
 
@@ -2511,51 +1672,18 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
             break;
           }
 
-          case 'commandStatus': {
-            const { command, installed, resolvedPath } = message;
-            
-            pendingChecks.delete(command);
-            cliStatusCache.set(command, { installed, resolvedPath });
-            
-            if (modalEditorCommand.value.trim() === command) {
-              updateModalCliStatus(command);
-            }
-            
-            renderRail();
-            break;
-          }
-
           case 'restoreState': {
-            const { profiles: restoredProfiles, sessions: restoredSessions, activeSessionId: restoredActiveId } = message;
-            
-            // Restore profiles
-            profiles.clear();
-            if (restoredProfiles && restoredProfiles.length > 0) {
-              for (const p of restoredProfiles) {
-                profiles.set(p.agentId, {
-                  agentId: p.agentId,
-                  label: p.label,
-                  command: p.command,
-                  defaultArgs: p.defaultArgs || [],
-                  allowExtraArgs: p.allowExtraArgs !== false
-                });
-                const match = p.agentId.match(/profile-(\\d+)-/);
-                if (match) {
-                  profileCounter = Math.max(profileCounter, parseInt(match[1], 10));
-                }
-              }
-            }
-            
-            // Restore sessions as exited with read-only terminals
+            const { sessions: restoredSessions, activeSessionId: restoredActiveId } = message;
+
             if (restoredSessions && restoredSessions.length > 0) {
               for (const s of restoredSessions) {
                 if (sessions.has(s.sessionId)) continue;
-                
+
                 const { terminal, fitAddon, wrapper } = createRestoredTerminal(
-                  s.sessionId, 
+                  s.sessionId,
                   s.outputSnapshot || []
                 );
-                
+
                 sessions.set(s.sessionId, {
                   sessionId: s.sessionId,
                   command: s.command,
@@ -2570,36 +1698,43 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
                 });
               }
             }
-            
-            // Render UI
-            renderRail();
-            updateTopBar();
-            updateModalProfileSelect();
-            
-            // Restore active session if valid
+
             if (restoredActiveId && sessions.has(restoredActiveId)) {
-              switchToSession(restoredActiveId);
+              activeSessionId = restoredActiveId;
             } else if (sessions.size > 0) {
-              switchToSession(Array.from(sessions.keys())[0]);
+              activeSessionId = Array.from(sessions.keys())[0];
             }
-            
-            // Show empty state if no sessions
-            if (sessions.size === 0) {
-              emptyState.classList.remove('hidden');
+
+            renderSessionList();
+            updateActiveSessionHeader();
+            if (activeSessionId) {
+              switchToSession(activeSessionId, true);
             }
-            
-            stateRestored = true;
             break;
           }
         }
       });
 
-      // Initial render
-      renderRail();
-      updateTopBar();
-      
-      // Enable new button once profiles exist
-      btnNew.disabled = profiles.size === 0;
+      agentLaunch.addEventListener('click', () => {
+        spawnCommand(agentSelect.value);
+      });
+      agentSelect.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          spawnCommand(agentSelect.value);
+        }
+      });
+
+      const initUi = () => {
+        populateAgentSelect();
+        renderSessionList();
+        updateActiveSessionHeader();
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initUi);
+      } else {
+        initUi();
+      }
     })();
   </script>
 </body>
@@ -2629,10 +1764,15 @@ let providerInstance: OracleDockViewProvider | null = null;
  * 
  * SECURITY: Stores provider instance for deactivation cleanup.
  */
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  ensureSpawnHelperExecutable();
+
+  // Resolve login shell environment once on activation
+  const launchEnv = await resolveLoginShellEnv();
+
   // Register the WebviewViewProvider for the sidebar
-  // Pass context for globalState persistence
-  const provider = new OracleDockViewProvider(context.extensionUri, context);
+  // Pass context for workspaceState persistence
+  const provider = new OracleDockViewProvider(context.extensionUri, context, launchEnv);
 
   // SECURITY: Store singleton reference for deactivation
   providerInstance = provider;
@@ -2647,6 +1787,10 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     )
   );
+
+  void vscode.commands.executeCommand('workbench.action.focusAuxiliaryBar');
+  void vscode.commands.executeCommand('workbench.view.extension.oracledock-sidebar');
+  void vscode.commands.executeCommand('oracledock.sidebarView');
 
   // SECURITY: Add disposal to subscriptions for VS Code managed cleanup
   context.subscriptions.push({

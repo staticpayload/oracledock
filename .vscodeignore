@@ -2,6 +2,7 @@
 .vscode/**
 src/**
 node_modules/**
+!node_modules/node-pty/**
 .gitignore
 tsconfig.json
 esbuild.config.js
