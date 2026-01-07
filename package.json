@@ -4,6 +4,7 @@
   "description": "Sidebar terminal with dynamic CLI command input",
   "version": "0.0.1",
   "publisher": "oracledock",
+  "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -13,8 +14,17 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "oracledock-sidebar",
+          "title": "Oracle Dock",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "oracledock-sidebar": [
         {
           "type": "webview",
           "id": "oracledock.sidebarView",

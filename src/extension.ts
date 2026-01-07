@@ -20,18 +20,57 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as pty from 'node-pty';
 
+// ========== SECURITY LIMITS ==========
+// These constants enforce hard limits to prevent resource exhaustion attacks
+
+/** Maximum concurrent PTY sessions to prevent session bomb attacks */
+const MAX_SESSIONS = 20;
+
+/** Maximum output buffer size per session (5MB) to prevent memory exhaustion */
+const MAX_OUTPUT_BUFFER_BYTES = 5_000_000;
+
+/** Maximum lines to keep in output buffer to bound memory growth */
+const MAX_OUTPUT_BUFFER_LINES = 10_000;
+
+/** Maximum number of arguments per spawn command */
+const MAX_ARG_COUNT = 50;
+
+/** Maximum length of a single argument in bytes */
+const MAX_ARG_LENGTH = 4096;
+
+/** Whitelist pattern for command names - alphanumeric, dash, underscore only
+ *  No paths, no shell metacharacters, no path traversal */
+const COMMAND_REGEX = /^[a-zA-Z0-9_\-]+$/;
+
+/** Valid IPC message types from Webview - reject all others */
+const VALID_MESSAGE_TYPES = new Set([
+  'spawnSession', 'spawnSessionWithArgs', 'writeInput',
+  'resizeSession', 'killSession', 'focusSession',
+  'checkCommand', 'requestPersistedState',
+  'persistProfiles', 'persistSessions', 'setActiveSession'
+]);
+
+// Maximum dimensions for terminal resize to prevent integer overflow
+const MAX_TERMINAL_COLS = 500;
+const MAX_TERMINAL_ROWS = 200;
+
 // Session lifecycle states
 type SessionState = 'running' | 'exited' | 'crashed';
 
 // Session data structure - each session is fully isolated
+// SECURITY: Includes disposal tracking and listener references for proper cleanup
 interface Session {
   sessionId: string;
   command: string;
-  args: string[];         // Arguments passed to the command
+  args: string[];                   // Arguments passed to the command
   pty: pty.IPty;
-  outputBuffer: string[];  // Stores output for replay when switching sessions
+  outputBuffer: string[];           // Stores output for replay when switching sessions
+  outputBufferBytes: number;        // Track total bytes for memory limiting
   state: SessionState;
   exitCode?: number;
+  disposed: boolean;                // SECURITY: Prevent double-dispose
+  dataDisposable?: pty.IDisposable; // SECURITY: PTY data listener for cleanup
+  exitDisposable?: pty.IDisposable; // SECURITY: PTY exit listener for cleanup
 }
 
 // ========== Persistence Data Models ==========
@@ -166,6 +205,13 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * Handle incoming messages from Webview.
+   * 
+   * SECURITY: All messages are validated before processing:
+   * - Message type must be in whitelist
+   * - Payload fields are type-checked
+   * - sessionId format is validated
+   * - Resize dimensions are bounded
+   * 
    * Protocol:
    * - spawnSession: Create new PTY session with command (legacy, parses args from string)
    * - spawnSessionWithArgs: Create new PTY session with explicit command + args array
@@ -175,10 +221,36 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * - focusSession: Request session data replay for switching
    */
   private _handleMessage(message: WebviewMessage): void {
+    // SECURITY: Reject null/undefined messages
+    if (!message || typeof message !== 'object') {
+      console.warn('[OracleDock] Rejected null/invalid message');
+      return;
+    }
+
+    // SECURITY: Reject unknown message types (whitelist approach)
+    if (typeof message.type !== 'string' || !VALID_MESSAGE_TYPES.has(message.type)) {
+      console.warn('[OracleDock] Rejected unknown message type:', message.type);
+      return;
+    }
+
+    // SECURITY: Validate sessionId format when present
+    if (message.sessionId !== undefined) {
+      if (typeof message.sessionId !== 'string' || message.sessionId.length > 100) {
+        console.warn('[OracleDock] Rejected invalid sessionId');
+        return;
+      }
+    }
+
+    // SECURITY: Validate data when present
+    if (message.data !== undefined && typeof message.data !== 'string') {
+      console.warn('[OracleDock] Rejected invalid data field');
+      return;
+    }
+
     switch (message.type) {
       case 'spawnSession':
         // Legacy: parse command string into executable + args
-        if (message.command) {
+        if (message.command && typeof message.command === 'string') {
           const parts = message.command.trim().split(/\s+/);
           this._spawnSessionWithArgs(parts[0], parts.slice(1));
         }
@@ -186,15 +258,17 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
       case 'spawnSessionWithArgs':
         // New: explicit command + args array from agent profiles
-        if (message.command) {
-          this._spawnSessionWithArgs(message.command, message.args || []);
+        if (message.command && typeof message.command === 'string') {
+          const args = Array.isArray(message.args) ? message.args : [];
+          this._spawnSessionWithArgs(message.command, args);
         }
         break;
 
       case 'writeInput':
         if (message.sessionId && message.data) {
           const session = this._sessions.get(message.sessionId);
-          if (session && session.state === 'running') {
+          // SECURITY: Only write to running, non-disposed sessions
+          if (session && session.state === 'running' && !session.disposed) {
             // Forward raw input to PTY - xterm handles escape sequences
             session.pty.write(message.data);
           }
@@ -202,10 +276,17 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case 'resizeSession':
-        if (message.sessionId && message.cols && message.rows) {
+        // SECURITY: Validate cols/rows are numbers within bounds
+        if (message.sessionId &&
+          typeof message.cols === 'number' &&
+          typeof message.rows === 'number' &&
+          Number.isInteger(message.cols) &&
+          Number.isInteger(message.rows) &&
+          message.cols > 0 && message.cols <= MAX_TERMINAL_COLS &&
+          message.rows > 0 && message.rows <= MAX_TERMINAL_ROWS) {
           const session = this._sessions.get(message.sessionId);
-          if (session && session.state === 'running') {
-            // Resize PTY to match xterm dimensions
+          // SECURITY: Only resize running, non-disposed sessions
+          if (session && session.state === 'running' && !session.disposed) {
             session.pty.resize(message.cols, message.rows);
           }
         }
@@ -259,6 +340,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * Check if a command is installed and resolve its path.
    * Uses 'which' on macOS to resolve command location via PATH.
    * 
+   * SECURITY HARDENING:
+   * - Validates command against alphanumeric whitelist
+   * - Uses execFileSync (no shell) to prevent injection
+   * 
    * Discovery rules:
    * - Resolve commands using PATH only
    * - No scanning of dot folders
@@ -266,11 +351,23 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * - Installed = executable is resolvable and executable
    */
   private _checkCommandInstalled(command: string): void {
-    const { execSync } = require('child_process');
+    // SECURITY: Validate command before execution
+    if (!command || typeof command !== 'string' || !COMMAND_REGEX.test(command)) {
+      this._postMessage({
+        type: 'commandStatus',
+        command: command || '',
+        installed: false,
+        resolvedPath: undefined
+      });
+      return;
+    }
+
+    // SECURITY: Use execFileSync to avoid shell injection
+    const { execFileSync } = require('child_process');
 
     try {
-      // Use 'which' to resolve command path - macOS first
-      const resolvedPath = execSync(`which ${command}`, {
+      // execFileSync does NOT use a shell - safe from injection
+      const resolvedPath = execFileSync('which', [command], {
         encoding: 'utf8',
         timeout: 5000  // 5 second timeout to avoid hangs
       }).trim();
@@ -407,6 +504,14 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   /**
    * Spawn a new PTY session with explicit command and args array.
    * 
+   * SECURITY HARDENING:
+   * - Validates command against alphanumeric whitelist (no shell injection)
+   * - Validates argument count and length
+   * - Enforces session limit
+   * - Uses execFileSync for 'which' (no shell)
+   * - Tracks PTY listeners for cleanup
+   * - Bounds output buffer size
+   * 
    * Design decisions:
    * - Each session gets a unique sessionId
    * - Same command can be spawned multiple times (no reuse)
@@ -418,14 +523,64 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
    * - Args passed directly to node-pty (no shell expansion)
    */
   private _spawnSessionWithArgs(command: string, args: string[]): void {
+    // SECURITY: Enforce session limit to prevent resource exhaustion
+    if (this._sessions.size >= MAX_SESSIONS) {
+      this._postMessage({
+        type: 'error',
+        message: `Maximum sessions (${MAX_SESSIONS}) reached. Kill existing sessions first.`
+      });
+      return;
+    }
+
+    // SECURITY: Validate command - alphanumeric only, no paths, no shell metacharacters
+    if (!command || typeof command !== 'string' || !COMMAND_REGEX.test(command)) {
+      this._postMessage({
+        type: 'error',
+        message: `Invalid command name: "${command}". Only alphanumeric characters, dashes, and underscores allowed.`
+      });
+      return;
+    }
+
+    // SECURITY: Validate args count
+    if (args.length > MAX_ARG_COUNT) {
+      this._postMessage({
+        type: 'error',
+        message: `Too many arguments (${args.length}). Maximum is ${MAX_ARG_COUNT}.`
+      });
+      return;
+    }
+
+    // SECURITY: Validate each arg - must be string, bounded length
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (typeof arg !== 'string') {
+        this._postMessage({
+          type: 'error',
+          message: `Invalid argument at position ${i}: not a string`
+        });
+        return;
+      }
+      if (arg.length > MAX_ARG_LENGTH) {
+        this._postMessage({
+          type: 'error',
+          message: `Argument ${i} too long (${arg.length} bytes). Maximum is ${MAX_ARG_LENGTH}.`
+        });
+        return;
+      }
+    }
+
     const sessionId = this._generateSessionId();
 
     // Verify executable exists in PATH
-    // Using 'which' because we're macOS-first
-    const { execSync } = require('child_process');
+    // SECURITY: Using execFileSync with 'which' as first arg to avoid shell injection
+    const { execFileSync } = require('child_process');
     let resolvedPath: string;
     try {
-      resolvedPath = execSync(`which ${command}`, { encoding: 'utf8' }).trim();
+      // execFileSync does NOT use a shell - command is passed directly
+      resolvedPath = execFileSync('which', [command], {
+        encoding: 'utf8',
+        timeout: 5000  // 5 second timeout
+      }).trim();
     } catch {
       this._postMessage({
         type: 'error',
@@ -451,13 +606,16 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       });
 
       // Create session object with command and args stored separately
+      // SECURITY: Initialize with disposal tracking and byte counter
       const session: Session = {
         sessionId,
         command,
         args,
         pty: ptyProcess,
         outputBuffer: [],
-        state: 'running'
+        outputBufferBytes: 0,
+        state: 'running',
+        disposed: false
       };
 
       // Register session
@@ -472,9 +630,36 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       });
 
       // Stream PTY output to Webview and buffer for replay
-      ptyProcess.onData((data: string) => {
+      // SECURITY: Store listener reference for cleanup
+      const dataDisposable = ptyProcess.onData((data: string) => {
+        // SECURITY: Check disposed flag before processing
+        if (session.disposed) return;
+
+        // SECURITY: Enforce output buffer byte limit
+        if (session.outputBufferBytes + data.length > MAX_OUTPUT_BUFFER_BYTES) {
+          // Drop oldest entries to make room (keep ~50% of limit)
+          const targetSize = MAX_OUTPUT_BUFFER_BYTES / 2;
+          while (session.outputBuffer.length > 0 && session.outputBufferBytes > targetSize) {
+            const dropped = session.outputBuffer.shift();
+            if (dropped) {
+              session.outputBufferBytes -= dropped.length;
+            }
+          }
+        }
+
+        // SECURITY: Enforce line count limit
+        if (session.outputBuffer.length >= MAX_OUTPUT_BUFFER_LINES) {
+          // Remove oldest 10% of lines
+          const toRemove = Math.ceil(MAX_OUTPUT_BUFFER_LINES * 0.1);
+          const removed = session.outputBuffer.splice(0, toRemove);
+          for (const chunk of removed) {
+            session.outputBufferBytes -= chunk.length;
+          }
+        }
+
         // Buffer output for session switching replay
         session.outputBuffer.push(data);
+        session.outputBufferBytes += data.length;
 
         // Stream to Webview
         this._postMessage({
@@ -485,7 +670,11 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       });
 
       // Handle PTY exit
-      ptyProcess.onExit(({ exitCode }) => {
+      // SECURITY: Store listener reference for cleanup
+      const exitDisposable = ptyProcess.onExit(({ exitCode }) => {
+        // SECURITY: Check disposed flag - may have been killed already
+        if (session.disposed) return;
+
         session.state = 'exited';
         session.exitCode = exitCode;
 
@@ -499,6 +688,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
         });
       });
 
+      // SECURITY: Store disposables for cleanup
+      session.dataDisposable = dataDisposable;
+      session.exitDisposable = exitDisposable;
+
     } catch (err) {
       this._postMessage({
         type: 'error',
@@ -511,33 +704,85 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
   /**
    * Terminate a specific session by sessionId.
    * Does not affect other running sessions.
+   * 
+   * SECURITY HARDENING:
+   * - Guards against double-kill
+   * - Disposes PTY listeners before killing
+   * - Clears output buffer to free memory
+   * - Wrapped in try-catch for safety
    */
   private _killSession(sessionId: string): void {
     const session = this._sessions.get(sessionId);
-    if (session) {
-      if (session.state === 'running') {
-        session.pty.kill();
-        session.state = 'exited';
-      }
-      this._sessions.delete(sessionId);
-      this._postMessage({
-        type: 'sessionKilled',
-        sessionId
-      });
+    if (!session) return;
+
+    // SECURITY: Guard against double-kill
+    if (session.disposed) {
+      console.warn('[OracleDock] Session already disposed:', sessionId);
+      return;
     }
+
+    // SECURITY: Mark as disposed immediately to prevent race conditions
+    session.disposed = true;
+
+    // SECURITY: Dispose PTY listeners before killing to prevent callbacks
+    try {
+      session.dataDisposable?.dispose();
+    } catch { /* ignore disposal errors */ }
+
+    try {
+      session.exitDisposable?.dispose();
+    } catch { /* ignore disposal errors */ }
+
+    // Kill PTY if still running
+    if (session.state === 'running') {
+      try {
+        session.pty.kill();
+      } catch { /* ignore kill errors - PTY may already be dead */ }
+      session.state = 'exited';
+    }
+
+    // SECURITY: Clear output buffer to free memory
+    session.outputBuffer.length = 0;
+    session.outputBufferBytes = 0;
+
+    // Remove from registry
+    this._sessions.delete(sessionId);
+
+    // Notify Webview
+    this._postMessage({
+      type: 'sessionKilled',
+      sessionId
+    });
   }
 
   /**
    * Terminate all sessions.
-   * Called when Webview is disposed.
+   * Called when Webview is disposed or extension deactivates.
+   * 
+   * SECURITY HARDENING:
+   * - Uses _killSession for consistent cleanup
+   * - Iterates over snapshot to avoid modification during iteration
    */
   private _killAllSessions(): void {
-    for (const [sessionId, session] of this._sessions) {
-      if (session.state === 'running') {
-        session.pty.kill();
-      }
+    // SECURITY: Create snapshot of session IDs to avoid modification during iteration
+    const sessionIds = Array.from(this._sessions.keys());
+
+    for (const sessionId of sessionIds) {
+      this._killSession(sessionId);
     }
+
+    // SECURITY: Ensure registry is cleared even if individual kills failed
     this._sessions.clear();
+  }
+
+  /**
+   * Public dispose method for extension deactivation.
+   * 
+   * SECURITY: Ensures all PTYs are killed when extension deactivates.
+   * Prevents orphan processes on VS Code reload/restart.
+   */
+  public dispose(): void {
+    this._killAllSessions();
   }
 
   /**
@@ -566,6 +811,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     const xtermJsUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.js'));
     const xtermCssUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm.css'));
     const xtermFitUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'xterm-addon-fit.js'));
+    const brainLogoUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.png'));
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -577,6 +823,7 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     style-src ${webview.cspSource} 'unsafe-inline';
     script-src ${webview.cspSource} 'nonce-${nonce}';
     font-src ${webview.cspSource};
+    img-src ${webview.cspSource};
     connect-src ${webview.cspSource};
   ">
   <title>Oracle Dock</title>
@@ -868,14 +1115,28 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       gap: 12px;
     }
     
-    #empty-state svg {
-      width: 48px;
-      height: 48px;
-      opacity: 0.3;
+    #empty-state .brain-logo {
+      width: 180px;
+      height: auto;
+      opacity: 0.6;
+      filter: grayscale(100%);
+      transition: opacity 0.3s ease, filter 0.3s ease;
+    }
+    
+    #empty-state:hover .brain-logo {
+      opacity: 0.9;
+      filter: grayscale(0%);
     }
     
     #empty-state p {
-      font-size: 13px;
+      font-size: 16px;
+      font-weight: 500;
+      margin-top: 8px;
+    }
+    
+    #empty-state .empty-hint {
+      font-size: 12px;
+      opacity: 0.6;
     }
     
     #empty-state.hidden {
@@ -1169,12 +1430,9 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       <!-- Terminal Surface -->
       <div id="terminal-surface">
         <div id="empty-state">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1">
-            <rect x="2" y="3" width="12" height="10" rx="1"/>
-            <path d="M5 8l2 2-2 2"/>
-            <path d="M9 10h3"/>
-          </svg>
-          <p>No sessions yet</p>
+          <img src="${brainLogoUri}" alt="Oracle Dock" class="brain-logo">
+          <p>Oracle Dock</p>
+          <span class="empty-hint">Create a profile to get started</span>
         </div>
       </div>
       
@@ -1245,6 +1503,18 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
     (function() {
       // VS Code API for postMessage communication
       const vscode = acquireVsCodeApi();
+
+      // ========== SECURITY LIMITS (Client-side) ==========
+      // These limits mirror server-side limits for defense in depth
+      
+      /** Maximum lines to keep in client output buffer */
+      const MAX_CLIENT_BUFFER_LINES = 5000;
+      
+      /** Valid message types from extension - ignore unknown types */
+      const VALID_EXTENSION_MESSAGES = new Set([
+        'sessionStarted', 'sessionOutput', 'sessionExited', 'sessionKilled',
+        'error', 'ready', 'commandStatus', 'restoreState'
+      ]);
 
       // ========== DOM Elements ==========
       
@@ -1670,6 +1940,10 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       }
 
       function hideProfileEditorModal() {
+        // SECURITY: Clear pending debounce timer to prevent stale callbacks
+        if (typeof commandCheckTimeout !== 'undefined') {
+          clearTimeout(commandCheckTimeout);
+        }
         modalProfileEditor.classList.add('hidden');
         editingProfileId = null;
         modalCliStatus.textContent = '';
@@ -2140,16 +2414,40 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
       window.addEventListener('message', (event) => {
         const message = event.data;
 
+        // SECURITY: Validate message object
+        if (!message || typeof message !== 'object') {
+          console.warn('[OracleDock Webview] Ignored invalid message');
+          return;
+        }
+
+        // SECURITY: Reject unknown message types
+        if (typeof message.type !== 'string' || !VALID_EXTENSION_MESSAGES.has(message.type)) {
+          // Silently ignore unknown types - may be from other extensions
+          return;
+        }
+
         switch (message.type) {
           case 'sessionStarted': {
             const { sessionId, command, args } = message;
+            
+            // SECURITY: Validate required fields
+            if (typeof sessionId !== 'string' || typeof command !== 'string') {
+              console.warn('[OracleDock Webview] Invalid sessionStarted message');
+              break;
+            }
+
+            // SECURITY: Guard against duplicate session IDs
+            if (sessions.has(sessionId)) {
+              console.warn('[OracleDock Webview] Duplicate session ignored:', sessionId);
+              break;
+            }
             
             const { terminal, fitAddon, wrapper } = createTerminalForSession(sessionId);
             
             sessions.set(sessionId, {
               sessionId,
               command,
-              args: args || [],
+              args: Array.isArray(args) ? args : [],
               terminal,
               fitAddon,
               wrapper,
@@ -2164,8 +2462,19 @@ class OracleDockViewProvider implements vscode.WebviewViewProvider {
 
           case 'sessionOutput': {
             const { sessionId, data } = message;
+            
+            // SECURITY: Validate fields
+            if (typeof sessionId !== 'string' || typeof data !== 'string') break;
+            
             const session = sessions.get(sessionId);
             if (session && data) {
+              // SECURITY: Enforce client-side buffer limit
+              if (session.outputBuffer.length >= MAX_CLIENT_BUFFER_LINES) {
+                // Remove oldest 10% of entries
+                const toRemove = Math.ceil(MAX_CLIENT_BUFFER_LINES * 0.1);
+                session.outputBuffer.splice(0, toRemove);
+              }
+              
               session.outputBuffer.push(data);
               session.terminal.write(data);
             }
@@ -2311,14 +2620,22 @@ function getNonce(): string {
   return text;
 }
 
+// SECURITY: Singleton reference for deactivation cleanup
+let providerInstance: OracleDockViewProvider | null = null;
+
 /**
  * Extension activation.
  * Called when the extension is first activated (e.g., sidebar opened).
+ * 
+ * SECURITY: Stores provider instance for deactivation cleanup.
  */
 export function activate(context: vscode.ExtensionContext): void {
   // Register the WebviewViewProvider for the sidebar
   // Pass context for globalState persistence
   const provider = new OracleDockViewProvider(context.extensionUri, context);
+
+  // SECURITY: Store singleton reference for deactivation
+  providerInstance = provider;
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -2330,10 +2647,33 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     )
   );
+
+  // SECURITY: Add disposal to subscriptions for VS Code managed cleanup
+  context.subscriptions.push({
+    dispose: () => {
+      if (providerInstance) {
+        providerInstance.dispose();
+        providerInstance = null;
+      }
+    }
+  });
 }
 
 /**
  * Extension deactivation.
- * Cleanup is handled by subscription disposal.
+ * 
+ * SECURITY HARDENING:
+ * - Kills all running PTYs to prevent orphan processes
+ * - Clears provider reference
+ * 
+ * This is critical for:
+ * - VS Code reload: Prevents orphan PTYs
+ * - Extension host restart: Cleans up resources
+ * - Extension disable: Ensures clean shutdown
  */
-export function deactivate(): void { }
+export function deactivate(): void {
+  if (providerInstance) {
+    providerInstance.dispose();
+    providerInstance = null;
+  }
+}
